@@ -129,13 +129,13 @@ pick one per plan, within [vaults](https://osie.io/docs/ferry/features/vaults/),
 
 ## Supported deployments
 
-| Distribution | Deploy with | Guide | Verified on |
-|---|---|---|---|
-| kolla-ansible 2025.1 and newer | [`kolla-ansible/`](kolla-ansible) | [kolla-ansible guide](docs/kolla-ansible.md) | lab and production |
-| openstack-helm | [`helm/ferry`](helm/ferry), `presets/openstack-helm.yaml` | [chart README](helm/ferry/README.md) | openstack-helm 2025.1 lab |
-| Red Hat OpenStack Services on OpenShift 18 | [`helm/ferry`](helm/ferry), `presets/rhoso.yaml` | [chart README](helm/ferry/README.md) | RHOSO 18.0 lab |
-| Atmosphere, Genestack, StarlingX, MOSK, Yaook | [`helm/ferry`](helm/ferry), one preset each | [chart README](helm/ferry/README.md) | rendered and schema-checked in CI |
-| Charmed OpenStack, Canonical OpenStack (Sunbeam) | [`juju/`](juju) | [charms README](juju/README.md) | Charmed 2024.1 and Sunbeam 2024.1 labs |
+| Distribution | Deploy with | Verified on |
+|---|---|---|
+| **kolla-ansible** 2025.1 and newer | [kolla-ansible role](docs/kolla-ansible.md) | lab and production |
+| **openstack-helm** | [Helm chart](helm/ferry/README.md), `openstack-helm` preset | openstack-helm 2025.1 lab |
+| **Red Hat OpenStack Services on OpenShift** 18 | [Helm chart](helm/ferry/README.md), `rhoso` preset | RHOSO 18.0 lab |
+| **Atmosphere, Genestack, StarlingX, MOSK, Yaook** | [Helm chart](helm/ferry/README.md), one preset each | rendered and schema-checked in CI |
+| **Charmed OpenStack** and **Sunbeam** | [Juju charms](juju/README.md) | Charmed 2024.1 and Sunbeam 2024.1 labs |
 
 [Choosing a deployer](docs/deployers.md) compares them: which component of each
 distribution provides the database, Keystone, Ceph and the hypervisor agent.
@@ -241,7 +241,7 @@ Full guide: [juju/README.md](juju/README.md), or
 
 ## Requirements
 
-| | |
+| Requirement | Details |
 |---|---|
 | **Database** | MariaDB 10.6+ or MySQL 8.0.16+, usually the cloud's own |
 | **Identity** | a Keystone service user, created by every deployer |
@@ -278,7 +278,7 @@ they are not covered by this repository's license.
 
 ## Documentation
 
-| | |
+| Guide | Covers |
 |---|---|
 | [Overview](https://osie.io/docs/ferry/) | what Ferry protects and how operators and projects share the work |
 | [Architecture](https://osie.io/docs/ferry/operate/architecture/) | components, credentials and network paths |
