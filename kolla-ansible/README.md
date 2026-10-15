@@ -25,7 +25,7 @@ the module has no `action` parameter at all).
 
 One thing is expressed differently below 2026.1 Gazpacho, with no effect on the
 result. `kolla_toolbox` stringifies its `module_args` before that release, and a
-list of dicts does not survive it — so `appcred.yml` omits the explicit `roles:`
+list of dicts does not survive it, so `appcred.yml` omits the explicit `roles:`
 list there. Measured on a live cloud, that changes nothing: a credential created
 with the list and one created without it come back identical, both carrying
 every role the `ferry` service user holds. Keystone does not narrow the
@@ -33,16 +33,16 @@ credential to the requested list, so the list states intent rather than
 constraining anything.
 
 **The KEK needs an ACL, and `create-kek.sh` now sets one.** Barbican secrets are
-project-scoped, and Ferry does not read the KEK as admin — `ferry-manager`
+project-scoped, and Ferry does not read the KEK as admin: `ferry-manager`
 authenticates with its own application credential, as the `ferry` user in the
 `service` project. A KEK created under admin and left alone makes the very first
 repository registration fail with `403 Forbidden - Secret payload retrieval
 attempt not allowed`, surfaced as an internal error, because sealing the
 repository credential is the first thing that needs the key. If you provisioned
-the KEK before this was fixed, re-run `create-kek.sh` — it reuses the existing
+the KEK before this was fixed, re-run `create-kek.sh`; it reuses the existing
 secret and grants the ACL.
 
-The `cloud:` key is handled the same way — `openstack_auth_cloud` arrived in
+The `cloud:` key is handled the same way: `openstack_auth_cloud` arrived in
 2026.1, and `| default(omit, true)` sends the key where the variable exists and
 omits it where it does not. Both shapes are what upstream's own
 `service-ks-register` uses at the respective release. Supplying
@@ -77,7 +77,7 @@ cp inventory/ferry-groups /etc/kolla/ferry-groups
 cat etc/passwords.yml >> /etc/kolla/passwords.yml
 kolla-genpwd
 
-# 3. globals — copy what you need out of etc/globals.yml
+# 3. globals: copy what you need out of etc/globals.yml
 $EDITOR /etc/kolla/globals.yml
 
 # 4. the KEK, in Barbican, by hand and on purpose (see below)
@@ -118,8 +118,8 @@ secret id to put in `globals.yml`. A KEK reminted because a variable was empty
 is a repository nobody can read, and creating the key that decrypts every
 backup a tenant owns should leave a trail.
 
-Barbican does not make the single key go away — that is what envelope
-encryption is — it puts the key somewhere with real custody. The mitigation for
+Barbican does not make the single key go away (that is what envelope
+encryption is); it puts the key somewhere with real custody. The mitigation for
 losing a whole cloud is a portable envelope: `ferry key export` writes a
 domain key wrapped under a passphrase, with the repository and domain bound
 into the AEAD, for import into another cloud's key manager.
@@ -132,7 +132,7 @@ endpoints and user; `haproxy/services.d/ferry-manager.cfg` and the proxysql
 user and rules on the loadbalancer hosts. The restart that follows a changed
 fragment is kolla's: `ferry.yml`'s loadbalancer play runs kolla's own
 `loadbalancer` role and its container check around Ferry's fragments, exactly
-as `site.yml` does for every service, so kolla's handlers restart haproxy —
+as `site.yml` does for every service, so kolla's handlers restart haproxy:
 backup nodes first, the VIP holder last, keepalived stopped and started around
 it. That also means a Ferry run re-renders kolla's haproxy, keepalived and
 proxysql configuration from `globals.yml`, as any `kolla-ansible deploy --tags
@@ -151,7 +151,7 @@ asserts it: a tenant is told backups cannot be erased before they expire because
 the repository the policy writes to would not allow it.
 
 Create the bucket with Object Lock enabled (versioning comes with it) and
-register the contract with it — mode `compliance` or `governance`, a
+register the contract with it: mode `compliance` or `governance`, a
 `min_retention` floor, an optional ceiling, and a `soft_delete_grace`. OVH, MinIO
 and RGW all honour it; the driver asks the bucket rather than trusting the flag,
 and a write that asks for retention on a bucket that cannot lock fails the job
@@ -162,7 +162,7 @@ The floor is a floor, not a retention. Every object is held until
 it **commits**, from the roles it won in its policy's ladder: the first point of
 an anchored day is the daily, and if it also opens the week, month and year it
 holds all four at once. So a daily point is locked for the daily's horizon, not
-the yearly's — which is the one number that used to make a seven-year ladder cost
+the yearly's, which is the one number that used to make a seven-year ladder cost
 seven years for every point in it, chunks included. A chunk shared with an earlier
 point still has its lock extended to the later date; what changed is that the
 later date is now the right one.
@@ -185,7 +185,7 @@ and for writing the policy that writes to it.
 ## Authorization
 
 Ferry ships a complete rule set compiled in, so a deployment that configures
-nothing has every action covered — an action with no rule would deny on a working
+nothing has every action covered. An action with no rule would deny on a working
 endpoint and read like somebody's own override. The rules are oslo.policy-shaped,
 so existing policy tooling and instincts transfer.
 
@@ -194,11 +194,11 @@ what makes one action separable without restating the rest. The protection-polic
 `policy:write`, `policy:assign`, `policy:shorten`, `repository:lock`,
 `legal_hold:write`, `coverage:read`, `plan:pause:mandatory` and the vault action
 `vault:write`, all shipped as `rule:system_admin`, and `policy:list` and
-`vault:list` as `rule:project_reader` — a tenant sees only what the handler
+`vault:list` as `rule:project_reader`. A tenant sees only what the handler
 renders, which is sentences and never a repository name.
 
 The one override a deployment is likely to want is retention reductions behind a
-second role — Cohesity's Data Security role, Veeam's four-eyes:
+second role, like Cohesity's Data Security role or Veeam's four-eyes:
 
 ```yaml
 "policy:shorten": "rule:system_admin and role:data_security"
@@ -262,7 +262,7 @@ reach it. A job pointed at 9776 starts getting 401s the moment the manager is
 upgraded.
 
 9777 is TCP-mode rather than HTTP because it requires a client certificate and
-binds `mover_id` to its common name — haproxy has to pass the TLS session
+binds `mover_id` to its common name: haproxy has to pass the TLS session
 through, not terminate it. It carries unwrapped DEKs and is never
 token-authenticated, which is why it is never external.
 
@@ -273,7 +273,7 @@ certificates are not: kolla's internal certificate is a server certificate for
 the VIP. So the role runs its own, on the deploy host, under
 `/etc/kolla/config/ferry/pki/`:
 
-- one CA, reused forever — an existing one is never reminted, so re-running
+- one CA, reused forever: an existing one is never reminted, so re-running
   does not invalidate deployed certificates;
 - one server certificate for the mover API, naming the VIP and every manager;
 - one client certificate **per mover**, whose CN is that mover's `mover_id`.
@@ -284,7 +284,7 @@ the VIP. So the role runs its own, on the deploy host, under
   for that hypervisor, because that is the name the manager dials;
 - one client certificate shared by the managers for dialling those agents.
 
-Adding a mover or a hypervisor and re-running mints only the new leaf — except
+Adding a mover or a hypervisor and re-running mints only the new leaf, except
 the mover API's certificate, which is reissued because its SAN list has to
 grow.
 
@@ -295,7 +295,7 @@ Set `ferry_pki_generate: false` to provide all of this yourself.
 Ferry reads production RBD images directly; there is no Cinder or Nova API in
 the data path. `tools/create-cephx.sh` writes `ceph.conf` and three
 keyrings into `/etc/kolla/config/ferry/ceph/`, and the role distributes each
-one only to the component entitled to it — the manager's key never lands in the
+one only to the component entitled to it: the manager's key never lands in the
 mover's container, and the restore key is the only one that can write a live
 volume.
 
@@ -310,12 +310,12 @@ a resource is RBD-backed.
 resolves `filter_plugins`, `action_plugins`, `library` modules and
 `group_vars` relative to the playbook. A playbook anywhere else gets no
 `kolla_address`, no `merge_yaml`, no `kolla_container` and none of kolla's
-`group_vars/all` — which is most of what the role is written against.
+`group_vars/all`, which is most of what the role is written against.
 
 **Why Ferry ships no `group_vars` fragment.** It used to, symlinked beside
 kolla's own `group_vars/all/ferry.yml`. That only works from 2025.2, where
 `group_vars/all` is a directory; on 2025.1 and earlier it is the single file
-`all.yml`, and putting a directory next to it does not merge — ansible's
+`all.yml`, and putting a directory next to it does not merge: ansible's
 `DataLoader.find_vars_files` breaks on the first hit and checks the directory
 form first, so kolla's entire `all.yml` would be loaded *not at all*. The
 defaults live in the role instead, and `ferry.yml` spells `enable_ferry |

@@ -1,4 +1,4 @@
-module github.com/osie/ferry-deploy/helm
+module github.com/osie/ferry-backup/helm
 
 go 1.23
 

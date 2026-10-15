@@ -30,4 +30,4 @@ Helm chart, the Juju charms, the alert rules and the guides.
   Prometheus loads it only on `kolla-ansible reconfigure -t prometheus`. Run it
   after the upgrade to load the new alert.
 
-[0.17.0]: https://github.com/osie/ferry-deploy/releases/tag/v0.17.0
+[0.17.0]: https://github.com/osie/ferry-backup/releases/tag/v0.17.0

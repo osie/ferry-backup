@@ -28,7 +28,7 @@ deployer does not have to reinvent them:
   other has just added.
 - **The application credential.** Give the manager its service user's password
   and a secret, and it finds or creates its own restricted credential by name
-  (`keystone.application_credential_name`) — reused by every replica, replaced if
+  (`keystone.application_credential_name`), reused by every replica and replaced if
   its secret moves.
 - **The catalog entry.** `keystone.register_in_catalog` keeps Ferry's `backup`
   entry asserted, which is how it appears on distributions whose Keystone
@@ -64,11 +64,11 @@ directory, which each deployer mounts.
 | volume backup, restore, bytes compared | yes | no Cinder | yes | yes |
 | instance backup through the agent | yes | yes, SELinux enforcing | yes, AppArmor | yes, the snap's libvirt |
 | local qcow2 root restored in place, bytes compared | yes | yes | yes | yes |
-| local root restored as a new instance, boots | yes | — | — | — |
+| local root restored as a new instance, boots | yes | not tested | not tested | not tested |
 | guest stopped and started after a backup | yes | yes | yes | yes |
-| certificates renewed without a restart | yes, cert-manager | — | — | — |
+| certificates renewed without a restart | yes, cert-manager | not tested | not tested | not tested |
 | cephx split into three keys | yes, by the chart's Job | no Ceph | yes | yes |
 
 The byte comparison for a local root hashes the guest's view of the disk
 (`qemu-img convert` of the overlay) while the instance is paused, backs it up,
-stops it — a shutdown writes to the disk — restores in place and hashes again.
+stops it (a shutdown writes to the disk), restores in place and hashes again.

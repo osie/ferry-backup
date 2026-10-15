@@ -8,7 +8,7 @@ description: |
   libvirt's qemu-agent channel and, where the ferry application enables it,
   serves disks Ferry cannot read from the cluster.
 links:
-  source: https://github.com/osie/ferry-deploy
+  source: https://github.com/osie/ferry-backup
 base: ubuntu@24.04
 platforms:
   amd64:

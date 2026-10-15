@@ -1,71 +1,178 @@
-# Ferry deployment
+<p align="center">
+  <img alt="OSIE" src=".github/assets/osie-logo-light.svg#gh-light-mode-only" width="180">
+  <img alt="OSIE" src=".github/assets/osie-logo-dark.svg#gh-dark-mode-only" width="180">
+</p>
 
-[![CI](https://github.com/osie/ferry-deploy/actions/workflows/ci.yml/badge.svg)](https://github.com/osie/ferry-deploy/actions/workflows/ci.yml)
-[![Release](https://img.shields.io/github/v/release/osie/ferry-deploy?sort=semver)](https://github.com/osie/ferry-deploy/releases)
-[![License](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
+<h1 align="center">Ferry</h1>
 
-Deployment manifests for [Ferry](#what-ferry-is): backup, restore and disaster
-recovery for OpenStack. This repository holds what an operator needs to put Ferry
-on a cloud with the deployment tool that cloud already uses:
+<p align="center">
+  <strong>Backup and disaster recovery for OpenStack</strong><br>
+  Deployment manifests for kolla-ansible, Helm and Juju
+</p>
 
-| distribution | deploy with | guide | verified on |
-|---|---|---|---|
-| kolla-ansible 2025.1+ | [`kolla-ansible/`](kolla-ansible) | [kolla-ansible guide](docs/kolla-ansible.md) | lab and production |
-| openstack-helm | [`helm/ferry`](helm/ferry), `presets/openstack-helm.yaml` | [chart README](helm/ferry/README.md) | openstack-helm 2025.1 lab |
-| Atmosphere, Genestack, StarlingX, MOSK, Yaook | [`helm/ferry`](helm/ferry), one preset each | [chart README](helm/ferry/README.md) | rendered and schema-checked in CI, not yet in a lab |
-| Red Hat OpenStack Services on OpenShift 18 | [`helm/ferry`](helm/ferry), `presets/rhoso.yaml` | [chart README](helm/ferry/README.md) | RHOSO 18.0 lab |
-| Charmed OpenStack, Canonical OpenStack (Sunbeam) | [`juju/`](juju) | [charms README](juju/README.md) | Charmed 2024.1 and Sunbeam 2024.1 labs |
+<p align="center">
+  <a href="https://github.com/osie/ferry-backup/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/osie/ferry-backup/actions/workflows/ci.yml/badge.svg"></a>
+  <a href="https://github.com/osie/ferry-backup/releases"><img alt="Release" src="https://img.shields.io/github/v/release/osie/ferry-backup?sort=semver&color=4F52C9"></a>
+  <a href="LICENSE"><img alt="License: Apache-2.0" src="https://img.shields.io/badge/license-Apache--2.0-4F52C9"></a>
+  <a href="https://osie.io/docs/ferry/"><img alt="Documentation" src="https://img.shields.io/badge/docs-osie.io%2Fdocs%2Fferry-EB4869"></a>
+</p>
 
-[Where Ferry deploys](docs/deployers.md) compares them: who provides the database,
-Keystone, Ceph and the hypervisor agent on each.
+<p align="center">
+  <a href="https://osie.io/docs/ferry/"><strong>Documentation</strong></a>
+  &nbsp;·&nbsp;
+  <a href="#quick-start">Quick start</a>
+  &nbsp;·&nbsp;
+  <a href="docs/deployers.md">Choosing a deployer</a>
+  &nbsp;·&nbsp;
+  <a href="monitoring/README.md">Monitoring</a>
+  &nbsp;·&nbsp;
+  <a href="CHANGELOG.md">Changelog</a>
+</p>
 
-## What Ferry is
+<br>
 
-Ferry protects OpenStack workloads — Cinder volumes, Nova instances (including
-local disks, read through the hypervisor), and object storage buckets — into an
-S3-compatible repository, deduplicated and encrypted, with optional object lock so
-backups cannot be erased before their date. Tenants manage it through a `backup`
-service in the cloud's own Keystone catalog; operators set the policies.
+## About Ferry
 
-It runs as three components:
+Ferry is a backup and disaster recovery service for OpenStack clouds, developed by
+[OSIE](https://osie.io). It protects Nova instances, Cinder volumes and object storage
+buckets in S3-compatible storage, compressed, deduplicated and optionally encrypted
+and immutable. It restores them in place, as new resources or in another region.
 
-```mermaid
-flowchart LR
-    subgraph control["control plane"]
-        manager["ferry-manager<br/>API, scheduler, console"]
-        db[("MariaDB / MySQL")]
-        keystone["Keystone"]
-    end
-    subgraph data["data plane"]
-        mover["ferry-mover<br/>reads Ceph, writes the repository"]
-    end
-    subgraph hv["every hypervisor"]
-        compute["ferry-compute<br/>fsfreeze, local disks"]
-        libvirt["libvirt / QEMU"]
-    end
-    ceph[("Ceph")]
-    repo[("S3 repository<br/>object lock optional")]
+Cloud operators deploy Ferry and define its storage and protection policies. Project
+members choose which resources to protect and restore them themselves, through the
+console, the CLI or the API. Ferry registers as the `backup` service in the cloud's
+own Keystone catalog, so it uses the identities, projects and roles the cloud already
+has.
 
-    manager --- db
-    manager --- keystone
-    mover -- "mTLS: work orders" --> manager
-    manager -- "mTLS" --> compute
-    mover -- "mTLS: local disks" --> compute
-    compute --- libvirt
-    mover --> ceph
-    mover --> repo
-```
+This repository holds the manifests that deploy Ferry with the tool a cloud already
+uses. The product documentation is at **[osie.io/docs/ferry](https://osie.io/docs/ferry/)**.
 
-The manager holds the database and the Keystone credential. The mover holds
-neither: it reads production storage and writes the repository. The agent on
-each hypervisor freezes guests and reads local disks; it holds no repository
-credential and no encryption key.
+## Capabilities
+
+<table>
+<tr>
+<td width="50%" valign="top">
+
+**[Complete instance backups](https://osie.io/docs/ferry/features/backups/)**<br>
+The root disk and every attached volume, captured at the same instant, with the
+flavor, networks, key pair and security groups needed to recreate the instance.
+Guests can be frozen for about a second for filesystem consistency.
+
+</td>
+<td width="50%" valign="top">
+
+**[Incremental and deduplicated](https://osie.io/docs/ferry/operate/storage-backends/)**<br>
+After the first backup, only new data is stored. Ceph change tracking and qcow2
+dirty bitmaps read only what changed, and deduplication uploads only data the
+repository does not already hold.
+
+</td>
+</tr>
+<tr>
+<td valign="top">
+
+**[Replication](https://osie.io/docs/ferry/features/replication/)**<br>
+A second copy of every backup in another repository, site or provider, with its own
+retention. Replicas made by your object storage register as repositories of their
+own, and the recovery region reads from either.
+
+</td>
+<td valign="top">
+
+**[Immutable backups](https://osie.io/docs/ferry/features/immutable-backups/)**<br>
+S3 Object Lock in compliance mode. A backup cannot be erased before its retention
+date by anyone, including an administrator or an attacker holding the cloud's
+credentials.
+
+</td>
+</tr>
+<tr>
+<td valign="top">
+
+**[Encryption](https://osie.io/docs/ferry/features/encryption/)**<br>
+Per-domain data keys, sealed by a key held in Barbican or Vault, and encrypted
+before anything leaves the mover.
+
+</td>
+<td valign="top">
+
+**[Disaster recovery](https://osie.io/docs/ferry/features/disaster-recovery/)**<br>
+Recover protection groups in another region from backups, warm standbys or
+rbd-mirror copies, in boot order, with health checks. Test recovery in isolated
+networks and fail back when the home region returns.
+
+</td>
+</tr>
+<tr>
+<td valign="top">
+
+**[Flexible restores](https://osie.io/docs/ferry/features/restores/)**<br>
+Restore as new resources, over the original, or
+[attach a backup](https://osie.io/docs/ferry/features/file-recovery/) read-only to a
+running server to recover individual files.
+
+</td>
+<td valign="top">
+
+**[Ransomware signals](https://osie.io/docs/ferry/features/ransomware-signals/)**<br>
+Changes in compression, entropy and new data flag suspicious backups and point to
+the last recovery point taken before them.
+
+</td>
+</tr>
+<tr>
+<td valign="top">
+
+**[Policies and self-service](https://osie.io/docs/ferry/features/protection-policies/)**<br>
+Operators publish service levels with schedules, windows and retention. Projects
+pick one per plan, within [vaults](https://osie.io/docs/ferry/features/vaults/),
+[quotas](https://osie.io/docs/ferry/features/quotas/) and
+[usage reports](https://osie.io/docs/ferry/features/usage-and-reports/) for billing.
+
+</td>
+<td valign="top">
+
+**[Monitoring and coverage](https://osie.io/docs/ferry/features/monitoring/)**<br>
+A coverage report of unprotected resources, missed backups and copies still due,
+Prometheus metrics with ready-made alert rules, and a support bundle for diagnosing
+problems.
+
+</td>
+</tr>
+</table>
+
+## Supported deployments
+
+| Distribution | Deploy with | Verified on |
+|---|---|---|
+| **kolla-ansible** 2025.1 and newer | [kolla-ansible role](docs/kolla-ansible.md) | lab and production |
+| **openstack-helm** | [Helm chart](helm/ferry/README.md), `openstack-helm` preset | openstack-helm 2025.1 lab |
+| **Red Hat OpenStack Services on OpenShift** 18 | [Helm chart](helm/ferry/README.md), `rhoso` preset | RHOSO 18.0 lab |
+| **Atmosphere, Genestack, StarlingX, MOSK, Yaook** | [Helm chart](helm/ferry/README.md), one preset each | rendered and schema-checked in CI |
+| **Charmed OpenStack** and **Sunbeam** | [Juju charms](juju/README.md) | Charmed 2024.1 and Sunbeam 2024.1 labs |
+
+[Choosing a deployer](docs/deployers.md) compares them: which component of each
+distribution provides the database, Keystone, Ceph and the hypervisor agent.
+
+## Architecture
+
+<p align="center">
+  <img alt="Ferry's architecture: ferry-manager with Keystone and the database in the control plane, ferry-mover in the data plane reading Ceph and writing the S3 repository, and ferry-compute on every hypervisor, connected by mutual TLS" src=".github/assets/architecture.svg" width="900">
+</p>
+
+Each component holds only what its job needs. The **manager** holds the database and
+the Keystone credential. The **mover** reads production storage and writes the
+repository, and holds neither. The **agent** on each hypervisor freezes guests and
+reads local disks, and holds no repository credential and no encryption key. The
+[architecture guide](https://osie.io/docs/ferry/operate/architecture/) covers the
+details.
 
 ## Quick start
 
-Each guide covers prerequisites, credentials and upgrades. The short version:
+Each guide covers prerequisites, credentials, monitoring and upgrades. In short:
 
-**kolla-ansible**
+<details open>
+<summary><strong>kolla-ansible</strong></summary>
 
 ```sh
 cd kolla-ansible
@@ -77,7 +184,13 @@ kolla-ansible deploy -i /etc/kolla/inventory -i /etc/kolla/ferry-groups \
   -p /usr/local/share/kolla-ansible/ansible/ferry.yml
 ```
 
-**Helm** (openstack-helm and the distributions built on it, Yaook, RHOSO)
+Full guide: [docs/kolla-ansible.md](docs/kolla-ansible.md), or
+[on osie.io](https://osie.io/docs/ferry/operate/install/kolla-ansible/).
+
+</details>
+
+<details>
+<summary><strong>Helm</strong> (openstack-helm and its distributions, Yaook, RHOSO)</summary>
 
 ```sh
 helm upgrade --install ferry helm/ferry -n openstack \
@@ -85,10 +198,14 @@ helm upgrade --install ferry helm/ferry -n openstack \
   --set cloud.name=<this cloud>
 ```
 
-The chart is also published as an OCI artifact:
-`oci://ghcr.io/osie/charts/ferry`.
+The chart is also published as an OCI artifact at `oci://ghcr.io/osie/charts/ferry`.
+Full guide: [helm/ferry/README.md](helm/ferry/README.md), or
+[on osie.io](https://osie.io/docs/ferry/operate/install/helm/).
 
-**Juju** (Charmed OpenStack)
+</details>
+
+<details>
+<summary><strong>Juju</strong> (Charmed OpenStack and Sunbeam)</summary>
 
 ```sh
 juju deploy ./ferry_amd64.charm ferry \
@@ -108,60 +225,109 @@ juju integrate ferry-compute:manager ferry:compute
 ```
 
 `charmcraft pack` in `juju/ferry` and `juju/ferry-compute` builds the two charms.
-The [charms README](juju/README.md) covers Sunbeam too.
+Full guide: [juju/README.md](juju/README.md), or
+[on osie.io](https://osie.io/docs/ferry/operate/install/juju/).
+
+</details>
+
+## Using Ferry
+
+Projects work with Ferry from its console, its API or the `openstack backup` commands, which
+authenticate like every other OpenStack command:
+
+```sh
+pip install python-openstackclient python-ferryclient
+```
+
+A project member protects a server and restores it:
+
+```sh
+# The service levels the operator offers to this project
+openstack backup policy list
+
+# Protect a server under one of them, freezing the guest before each backup
+openstack backup plan create web-tier --resource-kind instance \
+  --resource <server-id> --policy <policy> --consistency filesystem
+
+# Take a backup now, then list the plan's backups
+openstack backup point create --plan web-tier --wait
+openstack backup point list --plan web-tier
+
+# Restore a backup as a new server, or attach it read-only to recover files
+openstack backup restore create --point <point-id> --mode instance --name web-01-restored --wait
+openstack backup attachment create --point <point-id> --instance <server-id>
+```
+
+An operator uses the same client for cloud-wide settings, such as a second copy of every backup
+taken under a policy, and to see what is not yet protected:
+
+```sh
+openstack backup policy set <policy> \
+  --copy-repository <repository> --copy-keep daily=7 --copy-keep monthly=12
+openstack backup coverage show
+```
+
+The [CLI reference](https://osie.io/docs/ferry/cli-reference/) lists every command and option.
 
 ## Requirements
 
-- MariaDB 10.6+ or MySQL 8.0.16+, usually the cloud's own.
-- A Keystone service user. Every deployer creates it.
-- Ceph, where the cloud has it. Clouds without Ceph are protected through their
-  hypervisors.
-- An S3-compatible repository. Object lock in compliance mode makes backups
-  immutable.
-- A private CA for Ferry's two mTLS relationships. Every deployer creates it.
+| Requirement | Details |
+|---|---|
+| **Database** | MariaDB 10.6+ or MySQL 8.0.16+, usually the cloud's own |
+| **Identity** | a Keystone service user, created by every deployer |
+| **Storage** | Ceph where the cloud has it; clouds without Ceph are protected through their hypervisors ([supported storage](https://osie.io/docs/ferry/operate/storage-backends/)) |
+| **Repository** | S3-compatible object storage; Object Lock in compliance mode for immutable backups ([repositories](https://osie.io/docs/ferry/operate/repositories/)) |
+| **PKI** | a private CA for Ferry's mTLS, created by every deployer |
 
-## Monitoring
+## Operating Ferry
 
-[`monitoring/ferry.rules`](monitoring/ferry.rules) holds Ferry's Prometheus alert
-rules, and every deployer installs them: kolla-ansible next to kolla's own
-Prometheus, the chart as a `PrometheusRule`, the charm through COS. Each component
-serves `/metrics` on its admin port. [`monitoring/`](monitoring) lists the alerts
-and how they are tested.
-
-## Diagnosing a problem
-
-`ferry admin support-bundle` builds one archive with everything needed to
-diagnose a problem, with credentials and tenant data left out. See
-[Support bundles](docs/support-bundle.md); attach one to a bug report.
-
-## Versions
-
-Tags match Ferry releases. A tag pins the images it deploys: the chart's
-`appVersion`, the charm's `version` default and the kolla-ansible role's
-`ferry_tag` all name it. [CHANGELOG.md](CHANGELOG.md) lists what changed for
-operators in each release.
+- **Monitoring.** [`monitoring/ferry.rules`](monitoring/ferry.rules) holds Ferry's
+  Prometheus alert rules, and every deployer installs them. Each component serves
+  `/metrics` on its admin port. See [monitoring](monitoring/README.md) and
+  [metrics, alerts and logs](https://osie.io/docs/ferry/operate/metrics-alerts-logs/).
+- **Diagnostics.** `ferry admin support-bundle` builds one archive for diagnosing a
+  problem, with credentials and tenant data left out. See
+  [support bundles](docs/support-bundle.md) and
+  [troubleshooting](https://osie.io/docs/ferry/operate/troubleshooting/).
+- **Upgrades.** Tags match Ferry releases, and each tag pins the images it deploys:
+  the chart's `appVersion`, the charm's `version` default and the role's `ferry_tag`
+  all name it. See the [changelog](CHANGELOG.md) and
+  [upgrades](https://osie.io/docs/ferry/operate/upgrades/).
 
 ## Container images
 
-The manifests deploy these images, published at `ghcr.io/osie`:
-
-| image | runs |
+| Image | Runs |
 |---|---|
 | `ghcr.io/osie/ferry-manager` | the manager |
 | `ghcr.io/osie/ferry-mover` | the mover |
 | `ghcr.io/osie/ferry-mover-flr` | the mover with file-level restore |
 | `ghcr.io/osie/ferry-compute` | the hypervisor agent |
 
-The images are built from Ferry's source, which is not part of this repository,
-and they are not covered by this repository's license.
+The images are built from Ferry's source, which is not part of this repository, and
+they are not covered by this repository's license.
+
+## Documentation
+
+| Guide | Covers |
+|---|---|
+| [Overview](https://osie.io/docs/ferry/) | what Ferry protects and how operators and projects share the work |
+| [Architecture](https://osie.io/docs/ferry/operate/architecture/) | components, credentials and network paths |
+| [Installation](https://osie.io/docs/ferry/operate/install/kolla-ansible/) | kolla-ansible, Helm and Juju |
+| [API reference](https://osie.io/docs/ferry/api-reference/) | the Ferry API |
+| [CLI reference](https://osie.io/docs/ferry/cli-reference/) | the `openstack backup` commands |
 
 ## Contributing
 
-Issues and pull requests are welcome. Read [CONTRIBUTING.md](CONTRIBUTING.md)
-first, and report security issues as [SECURITY.md](SECURITY.md) describes, not in
-a public issue.
+Issues and pull requests are welcome. Read [CONTRIBUTING.md](CONTRIBUTING.md) first,
+and report security issues privately as [SECURITY.md](SECURITY.md) describes.
 
 ## License
 
 The contents of this repository are licensed under the
 [Apache License, Version 2.0](LICENSE).
+
+<br>
+
+<p align="center">
+  <sub>Ferry is developed by <a href="https://osie.io">OSIE</a>.</sub>
+</p>
