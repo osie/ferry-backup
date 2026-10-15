@@ -71,12 +71,22 @@ repository does not already hold.
 <tr>
 <td valign="top">
 
+**[Replication](https://osie.io/docs/ferry/features/replication/)**<br>
+A second copy of every backup in another repository, site or provider, with its own
+retention. Replicas made by your object storage register as repositories of their
+own, and the recovery region reads from either.
+
+</td>
+<td valign="top">
+
 **[Immutable backups](https://osie.io/docs/ferry/features/immutable-backups/)**<br>
 S3 Object Lock in compliance mode. A backup cannot be erased before its retention
 date by anyone, including an administrator or an attacker holding the cloud's
 credentials.
 
 </td>
+</tr>
+<tr>
 <td valign="top">
 
 **[Encryption](https://osie.io/docs/ferry/features/encryption/)**<br>
@@ -84,8 +94,6 @@ Per-domain data keys, sealed by a key held in Barbican or Vault, and encrypted
 before anything leaves the mover.
 
 </td>
-</tr>
-<tr>
 <td valign="top">
 
 **[Disaster recovery](https://osie.io/docs/ferry/features/disaster-recovery/)**<br>
@@ -94,6 +102,8 @@ rbd-mirror copies, in boot order, with health checks. Test recovery in isolated
 networks and fail back when the home region returns.
 
 </td>
+</tr>
+<tr>
 <td valign="top">
 
 **[Flexible restores](https://osie.io/docs/ferry/features/restores/)**<br>
@@ -102,8 +112,6 @@ Restore as new resources, over the original, or
 running server to recover individual files.
 
 </td>
-</tr>
-<tr>
 <td valign="top">
 
 **[Ransomware signals](https://osie.io/docs/ferry/features/ransomware-signals/)**<br>
@@ -111,6 +119,8 @@ Changes in compression, entropy and new data flag suspicious backups and point t
 the last recovery point taken before them.
 
 </td>
+</tr>
+<tr>
 <td valign="top">
 
 **[Policies and self-service](https://osie.io/docs/ferry/features/protection-policies/)**<br>
@@ -118,16 +128,6 @@ Operators publish service levels with schedules, windows and retention. Projects
 pick one per plan, within [vaults](https://osie.io/docs/ferry/features/vaults/),
 [quotas](https://osie.io/docs/ferry/features/quotas/) and
 [usage reports](https://osie.io/docs/ferry/features/usage-and-reports/) for billing.
-
-</td>
-</tr>
-<tr>
-<td valign="top">
-
-**[Replication](https://osie.io/docs/ferry/features/replication/)**<br>
-A second copy of every backup in another repository, site or provider, with its own
-retention. Replicas made by your object storage register as repositories of their
-own, and the recovery region reads from either.
 
 </td>
 <td valign="top">
