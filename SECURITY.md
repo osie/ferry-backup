@@ -4,7 +4,7 @@
 
 Please do not open a public issue for a security problem. Report it privately
 through GitHub: open the repository's **Security** tab and choose **Report a
-vulnerability**, or go to <https://github.com/osie/ferry-deploy/security/advisories/new>.
+vulnerability**, or go to <https://github.com/osie/ferry-backup/security/advisories/new>.
 
 Include what is affected (a manifest, a default, a Ferry component), the versions,
 and how to reproduce it. We aim to acknowledge reports within three working days

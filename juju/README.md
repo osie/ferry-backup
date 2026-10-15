@@ -48,13 +48,13 @@ instant restore.
 **An instant tier needs Cinder's key to read it.** An instant restore is a clone
 of a snapshot in the RBD tier pool that Cinder adopts, and until Ferry's
 background flatten finishes, every read of the restored volume follows the
-clone into the tier — Cinder's when it adopts it, Nova's when it attaches it.
+clone into the tier: Cinder's when it adopts it, Nova's when it attaches it.
 Neither the `ferry` charm nor the Ceph broker grants Cinder's key anything on a
-pool Ferry created — `client.cinder-ceph` on Charmed OpenStack, which nova-compute
+pool Ferry created. That key is `client.cinder-ceph` on Charmed OpenStack, which nova-compute
 also attaches with through `ceph-access`, and on Sunbeam the key `cinder-volume`'s
 Ceph relation was issued (`ceph auth ls` names it). Add
 `profile rbd-read-only pool=<tier pool>` to it by hand, keeping its existing
-caps — `ceph auth caps` replaces the whole list.
+caps: `ceph auth caps` replaces the whole list.
 Without it every instant restore fails with `Cinder could not open the clone;
 its Ceph identity needs read access to tier pool <pool> until the flatten
 finishes`.

@@ -1,12 +1,12 @@
 # Installing Ferry on a kolla-ansible cloud
 
-For someone — or something — standing in front of an OpenStack deployment they
+For someone (or something) standing in front of an OpenStack deployment they
 did not build, with `kolla-ansible` on the deploy host and no prior knowledge of
 Ferry.
 
 Read [Decide what this cloud can protect](#0-decide-what-this-cloud-can-protect) before typing anything. Which
 storage the cloud uses decides the inventory, the flags, and which hosts need
-kernel modules — and it is the one thing that cannot be corrected afterwards
+kernel modules, and it is the one thing that cannot be corrected afterwards
 without redoing the install.
 
 ---
@@ -19,8 +19,8 @@ because most clouds have more than one kind of storage.
 | Path | Reads | Needs | Cost |
 |---|---|---|---|
 | **Cluster** | Ceph RBD | a cephx key | Cheapest. Real incrementals via `diff-iterate`. |
-| **Hypervisor** | anything a running guest has open — SAN LUN, LVM, NFS/qcow2, local file | `ferry-compute` on every hypervisor, and `ferry_local_disk_backup` | Reads cross a compute node. Incremental only where the disk is qcow2. |
-| **Fabric** | anything Cinder can mask to a host — **detached volumes**, and volumes attached to a guest that is not running | a mover zoned into the storage network; volume quota in Ferry's own project | A LUN mapping and an initiator session per read. Always a full read. A stopped guest's volume additionally costs a temporary snapshot and copy. |
+| **Hypervisor** | anything a running guest has open: SAN LUN, LVM, NFS/qcow2, local file | `ferry-compute` on every hypervisor, and `ferry_local_disk_backup` | Reads cross a compute node. Incremental only where the disk is qcow2. |
+| **Fabric** | anything Cinder can mask to a host: **detached volumes**, and volumes attached to a guest that is not running | a mover zoned into the storage network; volume quota in Ferry's own project | A LUN mapping and an initiator session per read. Always a full read. A stopped guest's volume additionally costs a temporary snapshot and copy. |
 
 Answer these three, in order:
 
@@ -29,11 +29,11 @@ Answer these three, in order:
    the fabric path, or both.
 2. **Does the cloud have volumes no running guest has open?** Detached ones, and
    ones attached to an instance that is shut off, suspended or shelved. Neither
-   has a QEMU to read through, so only the fabric path reaches them — the second
+   has a QEMU to read through, so only the fabric path reaches them, the second
    kind through a temporary copy, because Cinder will not attach a volume it
    still calls in-use.
 3. **Are any Nova instances booted from local disk?** `images_type` in
-   `nova.conf` — anything other than `rbd`. Those roots are readable only
+   `nova.conf`: anything other than `rbd`. Those roots are readable only
    through the hypervisor path.
 
 A cloud that is Ceph end to end needs none of the hypervisor, storage-fabric or
@@ -51,7 +51,7 @@ install, verify it, and stop.
   the kolla-ansible installation, and every `kolla-ansible` command for Ferry
   passes `-p <kolla-ansible>/ansible/ferry.yml`. The
   [kolla-ansible README](../kolla-ansible/README.md) has the commands.
-- **A key manager — Barbican or Vault — if you want encrypted backups.** Not
+- **A key manager (Barbican or Vault) if you want encrypted backups.** Not
   required; a cloud with neither can still back up, restore and replicate. See
   "Encryption, and whether you need a key manager" below for the choice and what it costs.
 - **Object storage for the repository**: an S3 endpoint (RGW, MinIO, anything
@@ -76,23 +76,23 @@ control
 [ferry-compute:children]
 compute
 
-# Empty unless you need the fabric path — see "Reading through the storage fabric" below.
+# Empty unless you need the fabric path; see "Reading through the storage fabric" below.
 [ferry-mover-fabric]
 ```
 
 What each is:
 
-- **ferry-manager** — the control plane. Holds the database credential and the
+- **ferry-manager**: the control plane. Holds the database credential and the
   KEK. Put it where other API services live.
-- **ferry-mover** — the data plane. Reads storage, writes the repository. Wants
+- **ferry-mover**: the data plane. Reads storage, writes the repository. Wants
   bandwidth and its own blast radius: a mover OOMing on a large volume must not
   take the API down with it.
-- **ferry-compute** — the quiesce agent, and optionally the local-disk read
+- **ferry-compute**: the quiesce agent, and optionally the local-disk read
   path. Must be on **every hypervisor** whose guests should get
   filesystem-consistent backups; it talks to that node's libvirt socket and
-  nothing else. Leaving a hypervisor out is supported — its guests get
+  nothing else. Leaving a hypervisor out is supported: its guests get
   crash-consistent backups, reported as such.
-- **ferry-mover-fabric** — movers zoned into the storage network. Empty by
+- **ferry-mover-fabric**: movers zoned into the storage network. Empty by
   default and **stays empty on a Ceph-only cloud**. See "Reading through the
   storage fabric" below before filling it in;
   it has host prerequisites the others do not.
@@ -106,8 +106,8 @@ supported is a KEK on local disk.
 
 | `ferry_kms_driver` | What you get |
 |---|---|
-| `barbican` / `vault` | Encrypted backups. A workload can have its own key, and then its own dedup domain — isolated from every other workload, which is what having its own key means. |
-| `none` | No encryption. Every unencrypted workload shares one repository-wide plaintext domain, so they dedup against each other — which is where the space savings are. A plan that asks for encryption is refused **when it is created**, not quietly written in the clear. |
+| `barbican` / `vault` | Encrypted backups. A workload can have its own key, and then its own dedup domain, isolated from every other workload, which is what having its own key means. |
+| `none` | No encryption. Every unencrypted workload shares one repository-wide plaintext domain, so they dedup against each other, which is where the space savings are. A plan that asks for encryption is refused **when it is created**, not quietly written in the clear. |
 | `file` | **Refused.** See below. |
 
 So: no, a key manager is not required. Pick `none` deliberately if the cloud has
@@ -118,19 +118,19 @@ readable by anyone who can read the bucket.
 against a real service: register a repository, back up, restore, and compare the
 restored volume byte for byte. The Vault run also rotated the transit key to a
 new version and re-verified a point written under the old one, which is the
-property that makes rotation safe — Vault decrypts under the version that
+property that makes rotation safe: Vault decrypts under the version that
 wrapped it.
 `none` has been run end to end as well, on a production cloud with no key
 manager: register a repository, back up, restore, compare byte for byte, and a
 filesystem-consistent instance backup through the quiesce agent. It needs
-0.4.21 or later — before that a repository could not be registered under it,
+0.4.21 or later. Before that a repository could not be registered under it,
 because its credential is sealed by envelope and `none` refuses to mint the
 key. Since 0.4.21 that credential is stored as written, in a frame that opens
 only under `none`.
 
 What is *not* a real option is `file`, and the precheck fails on it. A data
 encryption key is only ever stored wrapped under the KEK, so the KEK is the
-whole repository — and a key on local disk has no replication, no backup, no
+whole repository, and a key on local disk has no replication, no backup, no
 audit trail, and dies with the node. Losing it makes every point permanently
 unreadable. That is a trap rather than a trade-off, which is why it is refused
 rather than warned about.
@@ -146,13 +146,13 @@ ferry_kms_barbican_secret_id: "<uuid of a 32-byte secret you create>"
 
 The role deliberately does **not** mint the key. Provisioning the thing that
 decrypts every backup a tenant owns should leave a trail, not happen as a side
-effect of a deploy — and a KEK reminted because a variable was empty is a
+effect of a deploy, and a KEK reminted because a variable was empty is a
 repository nobody can read. `kolla-ansible/tools/create-kek.sh` mints one and
 prints the id to put here.
 
 Vault instead. **Ferry does no AppRole login**: `role_id`/`secret_id` on their
 own are not a runnable configuration, and the manager refuses to start on one.
-Give it a token, or better a file a Vault Agent keeps a fresh token in — the
+Give it a token, or better a file a Vault Agent keeps a fresh token in: the
 agent authenticates and renews, and Ferry re-reads the file rather than holding
 a credential that expires under it.
 
@@ -205,8 +205,8 @@ A cloud without a key manager also cannot hold a key imported from another
 cloud, so as a disaster recovery region it recovers only groups whose members
 the home region backs up under plans with `--encryption none`. Their group
 document is written unencrypted and read here without a key. A group whose
-members are in an encrypted dedup domain — including `default`, where a plan
-that names no encryption lands on a cloud with a key manager — is named as such
+members are in an encrypted dedup domain (including `default`, where a plan
+that names no encryption lands on a cloud with a key manager) is named as such
 by `ferry dr groups`, refused by `ferry dr register` with `key_manager_missing`,
 and its readiness carries `key_manager_missing` on each such member.
 
@@ -230,8 +230,8 @@ ferry_external_fqdn: "ferry.example.net"
 ferry_ceph_enabled: true
 ```
 
-If `ferry_ceph_enabled` is true, put `ceph.conf` where the role expects it —
-`{{ node_custom_config }}/ferry/ceph/ceph.conf` — and create the three cephx
+If `ferry_ceph_enabled` is true, put `ceph.conf` where the role expects it,
+`{{ node_custom_config }}/ferry/ceph/ceph.conf`, and create the three cephx
 users the role names: `ferry-manager`, `ferry-mover`, `ferry-restore`. Scope
 them read-only on production pools and read-write only on Ferry's own. The
 manager will not dispatch a job for a pool a mover has not advertised, so drift
@@ -248,8 +248,8 @@ repository (`ferry_manager_leaked_disk_bytes` in Prometheus). It deletes the dis
 only with the option on, and then only when Nova answers 404 for the instance and
 the disk has no snapshot or clone of anyone else's. The default is off because
 deleting a tenant's disk on the strength of an instance listing is your call. Ferry
-drops the anchor once it stops protecting the disk — when the instance leaves its
-plan, or when a deleted plan's soft-delete grace ends — so the exposure is a disk deleted
+drops the anchor once it stops protecting the disk (when the instance leaves its
+plan, or when a deleted plan's soft-delete grace ends), so the exposure is a disk deleted
 while protected or inside that grace. In `globals.yml`, then `kolla-ansible deploy` (the
 managers restart with it):
 
@@ -260,7 +260,7 @@ ferry_ceph_remove_nova_orphans: true
 On a cloud that already has leaked disks, turning it on is enough: the next
 reconcile pass over the Nova pool (within ten minutes with the default five-minute
 loop and two pools) removes every recorded one, including those whose anchor an
-earlier pass already dropped, and logs one line per disk —
+earlier pass already dropped, and logs one line per disk:
 `removed a disk Ferry's anchor leaked`, or `left a disk Ferry's anchor leaked in
 place:` and the reason. To keep the option off, remove them yourself: list the
 disks Ferry recorded from its database, confirm Nova answers "No server with a name
@@ -277,10 +277,10 @@ rbd rm vms/<uuid>_disk
 **If you keep an instant tier, Cinder needs to read it too.** An instant restore
 is an `rbd clone` out of the tier pool that Cinder adopts, and until Ferry's
 background flatten finishes, every read of that volume follows the clone back
-into the tier — Cinder's own, when it adopts it, and Nova's, when it attaches
+into the tier: Cinder's own, when it adopts it, and Nova's, when it attaches
 it. Kolla's Cinder and Nova attach RBD volumes as `client.{{ ceph_cinder_user }}`
 (`cinder` by default), and that key has no caps on a pool Ferry created. Add
-read-only caps on the tier pool to whatever it already has — `ceph auth caps`
+read-only caps on the tier pool to whatever it already has. `ceph auth caps`
 replaces the whole list, so repeat the existing caps:
 
 ```bash
@@ -340,8 +340,8 @@ kolla-ansible -i <inventory> reconfigure --tags common
 ## 5. Reading disks through the hypervisor
 
 Turn this on when any instance has a root or a volume Ferry cannot read from the
-cluster. It makes `ferry-compute` a data-plane component — it will stream the
-contents of a guest's disk to a mover — which is a different security posture
+cluster. It makes `ferry-compute` a data-plane component (it will stream the
+contents of a guest's disk to a mover), which is a different security posture
 from the quiesce-only agent, so it is off by default and you should choose it.
 
 ```yaml
@@ -374,8 +374,8 @@ than silently downgrade.
 
 ## 6. Reading through the storage fabric
 
-Needed for volumes on storage that is not Ceph — **detached** ones, and ones
-attached to a guest no hypervisor can serve — and to restore onto them. Only
+Needed for volumes on storage that is not Ceph (**detached** ones, and ones
+attached to a guest no hypervisor can serve), and to restore onto them. Only
 fill in `[ferry-mover-fabric]` once these hold:
 
 **A fabric mover must be the only iSCSI stack on its host.** Not tidiness.
@@ -402,7 +402,7 @@ ferry_fabric_multipath: false   # DEVICE-MAPPER multipath only
 
 `ferry_fabric_multipath` is dm-multipath, which needs a running `multipathd`.
 NVMe-oF does its own multipath in the kernel (ANA) and this switch neither
-enables nor disables it — the connector detects that separately.
+enables nor disables it; the connector detects that separately.
 
 These hosts run **privileged**, with the host's `/dev`, `/lib/modules`, and a
 persistent initiator identity: on its first start each mover generates its own
@@ -411,12 +411,12 @@ never changes one that is already there. Where it shares kolla's iscsid it uses
 the host's name from kolla's `iscsi_info` instead. The role arranges all of it;
 that is why fabric
 movers are a group rather than a flag. Being in the fabric is zoning and
-initiator registration on a real array — per host, and not something a deploy
+initiator registration on a real array, per host, and not something a deploy
 can conjure.
 
 **Give Ferry's own project volume quota.** A volume attached to a guest that is
-not running cannot be attached to a mover — Cinder calls it in-use for as long as
-it is attached — so Ferry reads a temporary copy: a snapshot, and a volume built
+not running cannot be attached to a mover (Cinder calls it in-use for as long as
+it is attached), so Ferry reads a temporary copy: a snapshot, and a volume built
 from it. Cinder creates both under the credential that asked, so they land
 in **Ferry's** project (`service` on a kolla deploy), never the tenant's. That
 project therefore needs, per copy in flight, one volume, one snapshot, and the
@@ -436,7 +436,7 @@ protected.
 ## 7. Buckets and file-level recovery
 
 **Object storage.** Ferry protects buckets through one RGW realm. On a cloud
-whose RGW kolla already knows about — `enable_ceph_rgw: "yes"` — one flag is the
+whose RGW kolla already knows about (`enable_ceph_rgw: "yes"`), one flag is the
 whole change:
 
 ```yaml
@@ -453,7 +453,7 @@ know about.
 
 The gateway credential is an RGW user with `system` set, which reads any bucket
 in the realm. Minting one needs `radosgw-admin` and a Ceph admin keyring, which a
-kolla control host does not have when Ceph is deployed separately — so it is a
+kolla control host does not have when Ceph is deployed separately, so it is a
 tool, run once on a mon or wherever you ran `create-cephx.sh`:
 
 ```bash
@@ -468,16 +468,16 @@ deploy host if you ran the tool elsewhere, or set `ferry_objects_access_key` and
 `ferry_objects_secret_key` yourself.
 
 Own the copy as the user who runs `kolla-ansible`. The role reads it with become
-disabled — for the reason `appcred.yml` sets out, kolla's inventory carries
-`ansible_become=true` in `[all:vars]` and that beats a task's `become` for a
-`delegate_to: localhost` task — so a root-owned copy fails the deploy with
+disabled. For the reason `appcred.yml` sets out (kolla's inventory carries
+`ansible_become=true` in `[all:vars]`, and that beats a task's `become` for a
+`delegate_to: localhost` task), a root-owned copy fails the deploy with
 "Could not find or access".
 
 Turning the flag on with no credential fails the deploy with those instructions,
 rather than rendering a manager that answers every bucket operation with a 403.
 
 Leave `ferry_objects_enabled` off and bucket plans are refused with that as the
-reason, and the console hides the feature — the honest answer for a cloud with no
+reason, and the console hides the feature: the honest answer for a cloud with no
 gateway.
 
 **File-level recovery** lets a tenant browse a point and pull individual files
@@ -507,7 +507,7 @@ docker cp "$id:/usr/local/bin/ferry" /usr/local/bin/ferry
 docker rm "$id"
 ```
 
-Or, if you would rather not put it on the host, run it in place — this is also
+Or, if you would rather not put it on the host, run it in place. This is also
 the quickest way to check a fresh deploy from the control node itself:
 
 ```bash
@@ -517,7 +517,7 @@ docker exec -e OS_AUTH_URL -e OS_USERNAME -e OS_PASSWORD -e OS_PROJECT_NAME \
 ```
 
 **Authentication is ordinary OpenStack.** `OS_*` environment variables and
-`clouds.yaml` are both honoured, and `--os-cloud` selects an entry — so an
+`clouds.yaml` are both honoured, and `--os-cloud` selects an entry, so an
 existing `admin-openrc.sh` or `clouds.yaml` already works:
 
 ```bash
@@ -528,7 +528,7 @@ ferry plan list
 **The endpoint is discovered from the catalog**, under service type `backup`,
 which the role registers. You do not configure a URL. If the CLI cannot find
 it, the endpoint is missing or your token is scoped to a project that cannot
-see it — check with:
+see it. Check with:
 
 ```bash
 openstack endpoint list --service backup
@@ -537,7 +537,7 @@ openstack endpoint list --service backup
 **Scope matters, and the operator commands need more than `admin`.** Plans,
 points and restores belong to a project: a tenant sees their own, an operator
 sees what their token is scoped to. But `repository`, `policy`, `legal-hold`,
-`coverage` and `admin` need a **system-scoped** token — an admin role on a
+`coverage` and `admin` need a **system-scoped** token. An admin role on a
 project is not enough, deliberately, because an admin role on *some* project is
 what every Horizon session carries. `policy list` is the one exception: a tenant
 may read the policies their project may name, as sentences.
@@ -547,8 +547,8 @@ source /etc/kolla/admin-openrc-system.sh   # OS_SYSTEM_SCOPE=all
 ferry repository list
 ```
 
-A `403 policy denies repository:...` — or `policy:write`, `policy:assign`,
-`repository:lock`, `legal_hold:write`, `coverage:read` — on an otherwise working
+A `403 policy denies repository:...` (or `policy:write`, `policy:assign`,
+`repository:lock`, `legal_hold:write`, `coverage:read`) on an otherwise working
 install is almost always this.
 
 **Promoting a standby, and restoring into another project, need a role in that
@@ -556,8 +556,8 @@ project.** Both act in the target project through a Keystone trust the caller
 grants, and Keystone delegates only roles the caller holds in that project
 itself: an admin role on the system, or on some other project, does not count.
 So an operator account that runs `ferry standby promote`, or restores a
-tenant's backup — back into the tenant's project, or into another with `ferry
-restore create --target-project` — needs a role, `member` is enough, in every
+tenant's backup (back into the tenant's project, or into another with `ferry
+restore create --target-project`) needs a role, `member` is enough, in every
 project it acts in. Without one the request is refused with `403 restore_trust_refused`,
 *no role on the target project*, before anything is created. Grant it per
 project, and use a password session: Keystone will not delegate from a token
@@ -570,7 +570,7 @@ openstack role add --user <operator> --user-domain Default \
 
 ---
 
-## 9. Register a repository — a deploy alone backs up nothing
+## 9. Register a repository: a deploy alone backs up nothing
 
 The role does not create one. Until a repository exists there is nowhere for a
 backup to go, and every plan is unsatisfiable.
@@ -591,8 +591,8 @@ ferry repository register \
 The site name defaults to the region, lowercased (`ferry_site_name`). Movers
 claim work from their own site, so this has to match.
 
-A repository another site can read too — a bucket the recovery region reaches,
-or a replica the store keeps there — says so with `--reachable-from-site <site>`
+A repository another site can read too (a bucket the recovery region reaches,
+or a replica the store keeps there) says so with `--reachable-from-site <site>`
 (repeated, a name or an id; `ferry site list`) or `--replica-of <repository>`.
 A policy that recovers at another site needs one. `ferry repository update`
 replaces either, and `--clear-reachable-from-sites` and `--clear-replica-of`
@@ -654,7 +654,7 @@ Editing the contract later is `repository:lock`, which is a separate action from
 
 ---
 
-## 10. Write a policy — a plan cannot be created without one
+## 10. Write a policy: a plan cannot be created without one
 
 **The operator writes policies; a tenant names one.** A plan carries no schedule,
 no retention, no RPO and no immutability flag: every one of those is read off the
@@ -696,7 +696,7 @@ What each group does, and the one refusal worth knowing about in advance:
 - **`--every` and `--at` replace a cron expression.** `--cron` exists for
   "weekdays only" and an operator who knows what they are doing; a tenant never
   sees either. `--window-start`/`--window-end` and `--jitter` are the load knobs,
-  stated once for every plan under the policy — which is how 400 plans on one
+  stated once for every plan under the policy, which is how 400 plans on one
   cadence stop being 400 chances to type `0 2 * * *` with no jitter. A window may
   cross midnight; one that opens and closes at the same minute is refused, since
   no backup could ever start in it.
@@ -714,7 +714,7 @@ What each group does, and the one refusal worth knowing about in advance:
 - **The tiers name repositories you registered.** `--backup-repository` is
   required. `--instant-repository` is the RBD tier and `--instant-within` how long
   a point stays instantly restorable. `--copy-repository` is a second chunk
-  repository every committed point is copied to, with its own ladder — register a
+  repository every committed point is copied to, with its own ladder. Register a
   store that replicates on its own with `--replica-of` instead and write no copy
   tier. The copy's ladder has no anchors of its own: its weeks, months and years
   start where `--anchors` says, and an edit that leaves `--anchors` out keeps them.
@@ -820,7 +820,7 @@ preselects the policy when exactly one is usable.
   on, and the coverage report lists them.
 - **`ferry policy retire gold --successor platinum`** moves every plan to the
   successor in one transaction. The successor must be another active policy, not
-  weaker, and offered to every project whose plans move — assign it there first,
+  weaker, and offered to every project whose plans move. Assign it there first,
   or the refusal lists the projects it is missing. Points keep their dates
   through the move. A retire with no plans under it needs no successor.
 
@@ -864,19 +864,19 @@ In the kolla role those are `ferry_coverage_minimum_keep_all`,
 `ferry_coverage_requires_lock` and `ferry_missed_tick_window`.
 
 The same figures are published as `ferry_coverage_*` gauges, labelled by project,
-by a loop of their own on a five-minute cadence —
+by a loop of their own on a five-minute cadence:
 `ferry_coverage_interval` and `ferry_coverage_metrics_enabled` in the role, or
 `loops.coverage` in the manager's configuration. It is a separate loop on purpose:
 turning off "how full is the repository" must not also turn off "what is not
 protected". `loops.policy_verify` is separate from `loops.verify` for the same
-reason — the manager's rolling verification and the cadence an operator sold in a
+reason: the manager's rolling verification and the cadence an operator sold in a
 policy are two different promises.
 
 ### The zone a schedule is read in
 
 A policy's `at`, its window and its ladder anchors are wall-clock, so they need a
 zone. The manager uses `retention.timezone`, and with none set it falls back to
-the host's own — which inside a container is UTC, so `at: "02:00"` fires at 02:00
+the host's own, which inside a container is UTC, so `at: "02:00"` fires at 02:00
 UTC however the hypervisor is configured. State it explicitly if the operator
 writing policies thinks in local time:
 
@@ -890,8 +890,8 @@ tzdata, which the image carries. A daily schedule keeps its wall-clock time acro
 a DST change rather than drifting by the offset, and the hour that does not exist
 on a spring-forward day resolves forward rather than being skipped.
 
-Every write in this section — the policy, the assignment, the contract, a
-shorten, a hold, a mandatory override — is in the audit log with who and what.
+Every write in this section (the policy, the assignment, the contract, a
+shorten, a hold, a mandatory override) is in the audit log with who and what.
 
 ---
 
@@ -921,7 +921,7 @@ ferry restore create --point <point-id> --mode volume --name smoke-restored --wa
 ```
 
 `ferry resource list` is the most useful command here. `PROTECTABLE` and
-`REFUSAL` tell you what this cloud can and cannot do **before** a plan exists —
+`REFUSAL` tell you what this cloud can and cannot do **before** a plan exists,
 and a refusal names what to change.
 
 Your own name, logo and colour on the console are `ferry_console_*` in
@@ -1021,7 +1021,7 @@ Every row below is a real failure with a misleading first impression.
 | A moved tag did not take effect | `deploy` does not pull. Run `pull` first. |
 | Every instant restore fails `Cinder could not open the clone`, and `cinder-volume` logs `rbd.PermissionError … at snapshot None` in `manage_existing_get_size` | Cinder's key cannot read the tier pool the clone's parent lives in. Grant `client.cinder` `profile rbd-read-only pool=<tier pool>` alongside its existing caps. |
 | A warm recover, a warm test or a standby promote fails `Cinder could not open the clone` naming the standby pool, and the cloned volume is in `error` | The same, for the standby pool: grant `client.cinder` `profile rbd-read-only pool=<standby pool>` alongside its existing caps. |
-| An instant restore fails `quota_exceeded` naming Ferry's own service project | Cinder adopts every clone in Ferry's project before handing it over, so that project's volume quota is what counts. Raise it — or, if Cinder counts volumes the project does not have, correct `quota_usages` for it; Ferry no longer leaves that drift behind. |
+| An instant restore fails `quota_exceeded` naming Ferry's own service project | Cinder adopts every clone in Ferry's project before handing it over, so that project's volume quota is what counts. Raise it. If Cinder counts volumes the project does not have, correct `quota_usages` for it instead; Ferry no longer leaves that drift behind. |
 
 ---
 
@@ -1031,8 +1031,8 @@ Short answer: don't, unless you mean to abandon what is there.
 
 A data key is stored wrapped, and the wrapped form **names the KMS that produced
 it**. Point a cloud at a different key store and every existing repository fails
-to unseal with exactly that — *"wrapped key was produced by barbican, this KMS
-is vault"* — which is honest, precise, and still means those points are
+to unseal with exactly that (*"wrapped key was produced by barbican, this KMS
+is vault"*), which is honest, precise, and still means those points are
 unreadable until you point it back. Nothing is corrupted: switch back and they
 return.
 
@@ -1046,7 +1046,7 @@ Two consequences worth knowing before you try it:
 - **A new repository is a separate registration.** The KMS seals repository
   credentials at `register` time, so a repository registered under Barbican
   stays a Barbican repository. Migrating means registering a new one under the
-  new key store and letting retention age the old one out — there is no
+  new key store and letting retention age the old one out. There is no
   in-place re-key.
 
 ---
@@ -1076,8 +1076,8 @@ its commits, for exactly this reason.
 jobs finish for `ferry_mover_drain_timeout_seconds` (90), then hands whatever is
 still running back to resume on another mover from what it already wrote,
 without spending an attempt. The role stops the mover container with
-`graceful_timeout` set to `ferry_mover_stop_timeout` — the drain plus 60
-seconds, for the cut jobs to unwind and report — on a deploy, an upgrade and
+`graceful_timeout` set to `ferry_mover_stop_timeout` (the drain plus 60
+seconds, for the cut jobs to unwind and report) on a deploy, an upgrade and
 `kolla-ansible stop` alike, and gives `client_timeout`, how long kolla waits
 for the stop before it removes the container, half a minute more. Kolla runs
 each container under a systemd unit whose stop timeout is systemd's default of
@@ -1092,7 +1092,7 @@ deploy of a release that carries these settings still stops the old mover with
 kolla's own timeout, because kolla rewrites a container's unit only when it
 recreates or restarts it. Raise the drain if your backups often have a few
 minutes left when you deploy, and leave the stop timeout derived from it. A
-mover that dies without draining — killed, crashed, out of memory — is reported
+mover that dies without draining (killed, crashed, out of memory) is reported
 on each of its jobs once the lease runs out: `mover … stopped reporting during
 attempt N of M`.
 
@@ -1103,7 +1103,7 @@ plan onto an operator's protection policy, and `0041` drops those
 columns. A plan that existed before the upgrade therefore comes out of it naming
 **no policy**: it is listed, it keeps its resources and its key, and it takes no
 backups at all until an operator puts it on one. Nothing guesses a policy for it,
-because the guess would be a service level nobody agreed to — and a plan silently
+because the guess would be a service level nobody agreed to, and a plan silently
 attached to the wrong ladder is worse than one visibly stopped.
 
 So plan the upgrade as three steps, and do the first one before the upgrade if you
@@ -1122,5 +1122,5 @@ ferry plan update <plan-id> --policy gold # one plan onto it
 reach zero, and it lists the plans with the project each belongs to. The same
 figure is on `GET /v1/coverage` and in the console's Coverage page, and the plans
 appear there under "not running" with that reason in words. Until it is zero, some
-of this cloud is not being backed up — and it will not alarm on its own, because
+of this cloud is not being backed up, and it will not alarm on its own, because
 a plan with no policy has no schedule to miss.

@@ -40,8 +40,8 @@ the plain API port, since the agent holds no client certificate;
 ## Before you install
 
 **Install into the namespace the rest of OpenStack lives in.** The chart reads
-the platform's own Secrets and ConfigMaps — the database admin password, the
-Keystone admin credentials, `ceph.conf`, the Ceph admin key — and Kubernetes does
+the platform's own Secrets and ConfigMaps (the database admin password, the
+Keystone admin credentials, `ceph.conf`, the Ceph admin key), and Kubernetes does
 not mount those across namespaces. On openstack-helm that is `openstack`.
 
 **cert-manager must be installed.** Ferry's two mTLS relationships (mover to
@@ -70,8 +70,8 @@ The admin credentials reach only that init container. The manager container
 never sees them.
 
 With `ceph.keyrings.bootstrap.enabled` a Job creates three cephx identities with
-a deliberate privilege split — the manager's, the mover's (read-only on production pools) and
-the restore identity (the only one that can write a live volume) — and writes
+a deliberate privilege split: the manager's, the mover's (read-only on production pools) and
+the restore identity (the only one that can write a live volume). It writes
 their keyrings into one Secret. It needs the Ceph admin key, and its Role can
 create Secrets and touch only that one. Without it, put the three keyrings in a
 Secret yourself and name it in `ceph.keyrings.existingSecret`; the keys are
@@ -87,7 +87,7 @@ restore keyring used to wait for librados to time out and fail every seal with
 **An instant tier needs Cinder's key to read it.** An instant restore is a clone
 of a snapshot in the tier pool (list it under `ceph.pools.ferry`), and until
 Ferry's background flatten finishes every read of the restored volume follows
-the clone into that pool — Cinder's, when it adopts the volume, and Nova's,
+the clone into that pool: Cinder's, when it adopts the volume, and Nova's,
 when it attaches it. The chart does not manage Cinder's cephx key, so grant the
 identity Cinder and Nova attach RBD volumes with (`client.cinder` on
 openstack-helm) `profile rbd-read-only pool=<tier pool>` alongside the caps it
@@ -122,8 +122,8 @@ them on its next pass.
 
 Passwords are generated into `<release>-credentials` on first install and kept
 across upgrades. The chart finds them again with `lookup`, which a renderer that
-never talks to the cluster (Argo CD, Flux with `helm template`) does not have —
-create that Secret yourself and set `credentials.existingSecret` there. Its keys
+never talks to the cluster (Argo CD, Flux with `helm template`) does not have.
+Create that Secret yourself and set `credentials.existingSecret` there. Its keys
 are `database-password`, `keystone-password` and `application-credential-secret`.
 
 ## The compute agents
@@ -141,13 +141,13 @@ that for a hypervisor whose `host_ip` is not the address to use.
 **Every agent shares one server identity**, checked by name
 (`compute.tlsServerName`) rather than by the address dialled. A per-node
 certificate would need every agent to be able to read every other agent's
-private key, or a controller minting them — and a DaemonSet has one pod
+private key, or a controller minting them, and a DaemonSet has one pod
 template. What sharing costs, stated plainly: a compromised hypervisor could
 answer as another hypervisor's agent to anything that reaches it. It cannot
 become a mover or the manager; its certificate is for server authentication only
 and its name is on no client list.
 
-**Where the hypervisors are not Kubernetes nodes** — RHOSO's EDPM — set
+**Where the hypervisors are not Kubernetes nodes** (RHOSO's EDPM), set
 `compute.daemonset: false` and `compute.edpm.enabled: true`. The chart then
 renders an `OpenStackDataPlaneService` whose playbook runs the agent under
 podman and systemd on every node of `compute.edpm.nodeSets`, and an
@@ -165,7 +165,7 @@ without a restart. On EDPM nodes the files are copies, so a renewal reaches
 them with the next `helm upgrade`, which re-runs the deployment.
 
 `compute.localDiskBackup` turns the agent into the read and write path for disks
-Ferry cannot reach from the cluster — Nova's local qcow2 roots, which is
+Ferry cannot reach from the cluster: Nova's local qcow2 roots, which is
 openstack-helm's default (`images_type: qcow2`). The scratch it hands QEMU must be
 under a path QEMU sees identically: `compute.libvirt.libDir`, which the libvirt
 chart mounts from the host. A restore writes the stopped guest's disk itself, a
@@ -203,7 +203,7 @@ What the kolla role can do and this chart cannot: file-level recovery (the
 `ferry-mover-flr` image and its browse listener), movers in the storage fabric
 (privileged, with the host's `/dev` and an initiator identity on a volume each
 replica owns), bucket
-protection through RGW, and a TLS listener on the manager itself — the API is
+protection through RGW, and a TLS listener on the manager itself. The API is
 plain HTTP inside the cluster and TLS terminates at the ingress or Route.
 
 ## Branding the console
@@ -294,4 +294,4 @@ scrapes them.
 | `ceph.mirror.enableImages` | false | let the managers enable snapshot mirroring on a hot group's images where the workload runs |
 | `console.productName` / `primaryColor` / `primaryColorDark` | empty | the console's name and brand colour |
 | `console.filesConfigMap` + `logo` / `logoDark` / `favicon` / `stylesheet` | empty | the console's images and CSS, by file name in that ConfigMap |
-| `extraObjects` | `[]` | anything else to render, templated — an HTTPRoute, a `KeystoneService` |
+| `extraObjects` | `[]` | anything else to render, templated: an HTTPRoute, a `KeystoneService` |
