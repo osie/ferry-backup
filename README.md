@@ -1,5 +1,6 @@
 <p align="center">
-  <a href="https://osie.io"><img alt="OSIE" src=".github/assets/osie-logo.svg" width="180"></a>
+  <img alt="OSIE" src=".github/assets/osie-logo-light.svg#gh-light-mode-only" width="180">
+  <img alt="OSIE" src=".github/assets/osie-logo-dark.svg#gh-dark-mode-only" width="180">
 </p>
 
 <h1 align="center">Ferry</h1>
