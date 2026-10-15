@@ -1,0 +1,104 @@
+# ferry-mover, the data plane. Rendered by kolla-ansible; override from
+# {{ node_custom_config }}/ferry/mover.yaml, which is merged over this file.
+#
+# Two absences here are the point rather than an oversight: no database
+# credential, because the component that holds encryption keys and talks to
+# object storage is not a database client, and no OpenStack credential, because
+# the mover never talks to OpenStack. Everything a job needs arrives inside the
+# work order it claimed — including which cephx identity to authenticate as.
+
+mover_id: "{{ ferry_mover_id }}"
+site: "{{ ferry_site_name }}"
+cloud: "{{ ferry_cloud_name }}"
+
+log_level: "{{ ferry_log_level }}"
+{% if ferry_log_file_enabled | bool %}
+log_file: /var/log/kolla/ferry/ferry-mover.log
+log_file_max_mib: {{ ferry_log_file_max_mib }}
+log_file_keep: {{ ferry_log_file_keep }}
+{% endif %}
+
+# The claim response carries an unwrapped DEK, so the mover authenticates with
+# a client certificate rather than a bearer token, and `insecure` is never set:
+# that would hand the keys to whatever answers on the manager's address.
+manager_url: "{{ ferry_mover_manager_url }}"
+tls:
+  client_cert: /etc/ferry/pki/mover.crt
+  client_key: /etc/ferry/pki/mover.key
+  ca_cert: /etc/ferry/pki/ca.crt
+
+# /metrics and /healthz, bound like every other admin surface here.
+listen: "{{ ferry_admin_bind_address | put_address_in_context('url') }}:{{ ferry_mover_admin_port }}"
+
+max_parallel: {{ ferry_mover_max_parallel }}
+
+{% if ferry_mover_capabilities %}
+# An operator override. Rendered only when one is set, because naming anything
+# here replaces the mover's own derivation entirely — and the mover knows better
+# than the deploy does: it advertises librbd only if it really holds a dialer,
+# localdisk only if it really holds a compute certificate, and attach only after
+# the connector has answered on this host. A list written here is a promise the
+# binary may not be able to keep, and the manager believes it.
+capabilities: {{ ferry_mover_capabilities | to_json }}
+{% endif %}
+
+{% if ferry_ceph_enabled | bool %}
+# Mirrors client.{{ ferry_ceph_mover_user }}'s cephx caps exactly: read-only on
+# everything production, read-write only on Ferry's own pools. The
+# manager will not dispatch a job for a pool a mover has not advertised, so
+# drift between this list and the key is a refused job rather than a permission
+# error discovered mid-backup.
+readable_pools: {{ ferry_mover_readable_pools | unique | list | to_json }}
+writable_pools: {{ ferry_mover_writable_pools | unique | list | to_json }}
+{% endif %}
+
+# How this mover reaches ferry-compute agents to read Nova local disks and
+# attached LUNs. The mover's second outbound dependency and, with attach
+# below, one of only two besides the manager — so it is opt-in: most movers read
+# Ceph and nothing else.
+#
+# It reuses this mover's own client certificate, whose CN is mover_id. The agent
+# checks that CN against its allowed list, so a mover not in the inventory when
+# the agents were configured is refused rather than trusted.
+compute:
+  enabled: {{ ferry_local_disk_backup | bool | lower }}
+{% if ferry_local_disk_backup | bool %}
+  client_cert: /etc/ferry/pki/mover.crt
+  client_key: /etc/ferry/pki/mover.key
+  ca_cert: /etc/ferry/pki/ca.crt
+  # A stall detector, not a budget for a whole backup: reads are ranged and
+  # bounded, so no single call should ever take this long.
+  timeout: {{ ferry_mover_compute_timeout }}
+{% endif %}
+
+{% if ferry_mover_is_fabric | bool %}
+# This mover is in the storage fabric, so it can attach a Cinder volume to
+# itself — the only way a DETACHED volume on a backend Ferry cannot read from
+# the cluster becomes readable at all.
+#
+# The connector is an external program rather than Go code on purpose: executing
+# a Cinder connection means logging into an iSCSI target, rescanning a Fibre
+# Channel bus, assembling multipath and waiting for udev, with a long tail of
+# per-array quirks os-brick already carries. The shipped one wraps os-brick;
+# anything speaking its three verbs will do, which is the escape hatch for a
+# fabric os-brick has never heard of.
+attach:
+  connector: {{ ferry_fabric_connector }}
+  # A fabric rescan that never returns is the classic way an attach hangs a
+  # backup for ever.
+  timeout: {{ ferry_fabric_connector_timeout }}
+{% endif %}
+
+# The same budget as the manager's, and these are this mover's own ceiling.
+image_parallelism: {{ ferry_mover_image_parallelism }}
+segment_parallelism: {{ ferry_mover_segment_parallelism }}
+read_parallelism: {{ ferry_mover_read_parallelism }}
+upload_parallelism: {{ ferry_mover_upload_parallelism }}
+
+# Longer than the manager's, so the mover-side sweep can never be the more
+# aggressive of the two.
+gc_grace_period: {{ ferry_mover_gc_grace_period }}
+
+poll_interval: 5s
+drain_timeout: {{ ferry_mover_drain_timeout_seconds | int }}s
+repo_open_timeout: {{ ferry_mover_repo_open_timeout }}

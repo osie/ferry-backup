@@ -1,0 +1,20 @@
+database:
+  embedded:
+    enabled: true
+
+keystone:
+  authUrl: http://keystone.yaook.svc:5000/v3
+  bootstrap:
+    enabled: true
+    adminSecret: ferry-keystone-admin
+
+ceph:
+  keyrings:
+    existingSecret: ferry-ceph-keyrings
+
+compute:
+  nodeSelector:
+    compute.yaook.cloud/hypervisor: ""
+  libvirt:
+    runDir: /run/libvirt
+    socket: libvirt-sock

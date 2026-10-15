@@ -1,0 +1,240 @@
+{{- define "ferry.computeConfig" -}}
+log:
+  level: {{ .Values.logLevel | quote }}
+  format: json
+api:
+  bind: {{ printf "0.0.0.0:%v" .Values.compute.port | quote }}
+  tls:
+    enabled: true
+    cert_file: /etc/ferry/pki/compute-server/tls.crt
+    key_file: /etc/ferry/pki/compute-server/tls.key
+    client_ca_file: /etc/ferry/pki/compute-server/ca.crt
+    require_client_cert: true
+    allowed_client_cns:
+      - {{ include "ferry.managerClientCN" . | quote }}
+      {{- if .Values.compute.localDiskBackup }}
+      - {{ printf "%s-*" (include "ferry.moverName" .) | quote }}
+      {{- end }}
+    min_version: "1.3"
+admin:
+  enabled: true
+  bind: {{ printf "127.0.0.1:%v" .Values.compute.adminPort | quote }}
+  metrics: true
+  pprof: false
+libvirt:
+  socket: {{ printf "%s/%s" .Values.compute.libvirt.runDir .Values.compute.libvirt.socket | quote }}
+  uri: {{ .Values.compute.libvirt.uri | quote }}
+  connect_timeout: 10s
+  call_timeout: 10s
+  reconnect_backoff: 2s
+freeze:
+  max_duration: {{ .Values.compute.maxFreeze | quote }}
+  watchdog_interval: 1s
+  thaw_retries: 5
+  thaw_retry_interval: 2s
+  warn_above: 2s
+  state_file: {{ printf "%s/freezes.json" .Values.compute.stateDir | quote }}
+  max_concurrent: 2
+backup:
+  enabled: {{ .Values.compute.localDiskBackup }}
+  {{- if .Values.compute.localDiskBackup }}
+  scratch_dir: {{ .Values.compute.scratchDir | quote }}
+  socket_dir: {{ .Values.compute.socketDir | quote }}
+  state_file: {{ printf "%s/backups.json" .Values.compute.stateDir | quote }}
+  max_duration: {{ .Values.compute.backup.maxDuration | quote }}
+  default_ttl: {{ .Values.compute.backup.defaultTTL | quote }}
+  watchdog_interval: 30s
+  max_concurrent: {{ .Values.compute.backup.maxConcurrent }}
+  max_scratch_bytes: {{ .Values.compute.maxScratchBytes | int64 }}
+  read_timeout: 2m
+  {{- end }}
+{{- end -}}
+{{- if and .Values.compute.enabled .Values.compute.daemonset }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "ferry.fullname" . }}-compute
+  labels:
+    {{- include "ferry.componentLabels" (dict "root" . "component" "compute") | nindent 4 }}
+data:
+  compute.yaml: |
+    {{- mergeOverwrite (include "ferry.computeConfig" . | fromYaml) (deepCopy .Values.compute.extraConfig) | toYaml | nindent 4 }}
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: {{ include "ferry.fullname" . }}-compute
+  labels:
+    {{- include "ferry.componentLabels" (dict "root" . "component" "compute") | nindent 4 }}
+spec:
+  selector:
+    matchLabels:
+      {{- include "ferry.selector" (dict "root" . "component" "compute") | nindent 6 }}
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
+  template:
+    metadata:
+      labels:
+        {{- include "ferry.componentLabels" (dict "root" . "component" "compute") | nindent 8 }}
+      annotations:
+        checksum/config: {{ include "ferry.computeConfig" . | sha256sum }}
+    spec:
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      serviceAccountName: {{ include "ferry.serviceAccount" . }}
+      automountServiceAccountToken: false
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.compute.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.compute.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- if or .Values.compute.awaitManagers .Values.compute.localDiskBackup }}
+      initContainers:
+        {{- if .Values.compute.awaitManagers }}
+        - name: await-managers
+          {{- include "ferry.image" (dict "root" . "image" .Values.images.compute) | nindent 10 }}
+          command: ["/usr/local/bin/ferry-compute", "await-managers"]
+          env:
+            - name: FERRY_COMPUTE_AWAIT_MANAGERS
+              value: {{ printf "%s.%s.svc:9776" (include "ferry.managerReplicasService" .) .Release.Namespace | quote }}
+          securityContext:
+            runAsUser: 65534
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: [ALL]
+        {{- end }}
+        {{- if .Values.compute.localDiskBackup }}
+        - name: scratch-ownership
+          {{- include "ferry.image" (dict "root" . "image" .Values.images.compute) | nindent 10 }}
+          command:
+            - /bin/sh
+            - -ec
+            - |
+              install -d -m 0755 "$(dirname "$SCRATCH")" "$(dirname "$SOCKETS")"
+              install -d -m 0770 -o "$QEMU_UID" -g "$QEMU_GID" "$SCRATCH" "$SOCKETS"
+          env:
+            - name: SCRATCH
+              value: {{ .Values.compute.scratchDir | quote }}
+            - name: SOCKETS
+              value: {{ .Values.compute.socketDir | quote }}
+            - name: QEMU_UID
+              value: {{ .Values.compute.qemu.uid | quote }}
+            - name: QEMU_GID
+              value: {{ .Values.compute.qemu.gid | quote }}
+          securityContext:
+            runAsUser: 0
+          volumeMounts:
+            - name: libvirt-lib
+              mountPath: {{ .Values.compute.libvirt.libDir }}
+        {{- end }}
+      {{- end }}
+      containers:
+        - name: compute
+          {{- include "ferry.image" (dict "root" . "image" .Values.images.compute) | nindent 10 }}
+          args: ["--config=/etc/ferry/compute.yaml"]
+          env:
+            - name: FERRY_NODE_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: HOST_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.hostIP
+            - name: FERRY_API_BIND
+              value: {{ printf "$(HOST_IP):%v" .Values.compute.port | quote }}
+            {{- if .Values.metrics.enabled }}
+            - name: FERRY_ADMIN_BIND
+              value: {{ printf "$(HOST_IP):%v" .Values.compute.adminPort | quote }}
+            {{- end }}
+            {{- with .Values.compute.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          ports:
+            - name: agent
+              containerPort: {{ .Values.compute.port }}
+              hostPort: {{ .Values.compute.port }}
+            {{- if .Values.metrics.enabled }}
+            - name: admin
+              containerPort: {{ .Values.compute.adminPort }}
+              hostPort: {{ .Values.compute.adminPort }}
+            {{- end }}
+          readinessProbe:
+            httpGet:
+              {{- if not .Values.metrics.enabled }}
+              host: 127.0.0.1
+              {{- end }}
+              path: /readyz
+              port: {{ .Values.compute.adminPort }}
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              {{- if not .Values.metrics.enabled }}
+              host: 127.0.0.1
+              {{- end }}
+              path: /healthz
+              port: {{ .Values.compute.adminPort }}
+            initialDelaySeconds: 15
+            periodSeconds: 20
+          {{- with .Values.compute.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          securityContext:
+            runAsUser: 0
+          volumeMounts:
+            - name: config
+              mountPath: /etc/ferry/compute.yaml
+              subPath: compute.yaml
+              readOnly: true
+            - name: pki
+              mountPath: /etc/ferry/pki/compute-server
+              readOnly: true
+            - name: libvirt-run
+              mountPath: {{ .Values.compute.libvirt.runDir }}
+            - name: state
+              mountPath: {{ .Values.compute.stateDir }}
+            {{- if .Values.compute.localDiskBackup }}
+            - name: libvirt-lib
+              mountPath: {{ .Values.compute.libvirt.libDir }}
+              mountPropagation: HostToContainer
+            - name: nova-instances
+              mountPath: {{ .Values.compute.novaInstancesDir }}
+              mountPropagation: HostToContainer
+            {{- end }}
+      volumes:
+        - name: config
+          configMap:
+            name: {{ include "ferry.fullname" . }}-compute
+        - name: pki
+          secret:
+            secretName: {{ include "ferry.pkiSecret" (dict "root" . "name" "compute-server") }}
+        - name: libvirt-run
+          hostPath:
+            path: {{ .Values.compute.libvirt.runDir }}
+            type: DirectoryOrCreate
+        - name: state
+          hostPath:
+            path: {{ .Values.compute.stateDir }}
+            type: DirectoryOrCreate
+        {{- if .Values.compute.localDiskBackup }}
+        - name: libvirt-lib
+          hostPath:
+            path: {{ .Values.compute.libvirt.libDir }}
+            type: DirectoryOrCreate
+        - name: nova-instances
+          hostPath:
+            path: {{ .Values.compute.novaInstancesDir }}
+            type: DirectoryOrCreate
+        {{- end }}
+{{- end }}

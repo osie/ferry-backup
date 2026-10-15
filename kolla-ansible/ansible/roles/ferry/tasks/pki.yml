@@ -1,0 +1,301 @@
+---
+# Ferry's private CA and the certificates for its three mTLS relationships.
+#
+# Everything here runs once, on the deploy host, because a private key that
+# belongs on one node has no business existing anywhere else on its way there —
+# and because the manager's certificate has to name every manager at once,
+# which only the deploy host knows.
+#
+# Idempotent by construction: a key or certificate that is already on disk is
+# left alone, so re-running does not invalidate what is already deployed.
+# Adding a mover or a compute node mints only the new leaf — except for the
+# manager's server certificate, whose SAN list has to grow, which is why that
+# one is reissued when the set of managers changes.
+
+#
+# NOTE ON ansible_become. Every task below that runs on the DEPLOY HOST sets
+# `vars: {ansible_become: false}`, not just `become: false`. kolla's own
+# multinode inventory carries `ansible_become=true` in [all:vars], and for a
+# delegate_to: localhost task that connection variable beats the task's become —
+# so the PKI and the credential id land root-owned. ansible then reads `src` and
+# include_vars on the CONTROLLER as the user running kolla-ansible, which cannot
+# read them back, and the deploy fails with "Could not find or access" after the
+# work has already been done.
+
+- name: Generate Ferry's PKI on the deploy host
+  run_once: true
+  delegate_to: localhost
+  vars:
+    ansible_become: false
+  become: false
+  when: ferry_pki_generate | bool
+  block:
+    - name: Ensuring Ferry's PKI directory exists
+      ansible.builtin.file:
+        path: "{{ ferry_pki_dir }}"
+        state: directory
+        mode: "0700"
+
+    # kolla_address takes the host as an argument, which map() cannot supply,
+    # so the manager addresses are accumulated rather than expressed as one
+    # filter chain. They become subjectAltNames below: a mover verifies the
+    # manager it dials, and an address the certificate does not name is a mover
+    # that will not hand over its claim.
+    - name: Resolving the manager API addresses
+      ansible.builtin.set_fact:
+        ferry_manager_api_addresses: "{{ ferry_manager_api_addresses | default([]) + ['api' | kolla_address(item)] }}"
+      loop: "{{ groups['ferry-manager'] | default([]) }}"
+
+    - name: Finding the per-host key material that is already current
+      ansible.builtin.find:
+        paths: "{{ ferry_pki_dir }}"
+        patterns: ["mover-*.crt", "mover-*.key", "compute-*.crt", "compute-*.key"]
+        age: "-{{ (ferry_pki_valid_days | int) - (ferry_pki_renew_before_days | int) }}d"
+      register: ferry_pki_current
+
+    - name: Recording which hosts already hold a current key and certificate
+      ansible.builtin.set_fact:
+        ferry_pki_have: "{{ ferry_pki_current.files | map(attribute='path') | map('basename') | list }}"
+
+    - name: Creating Ferry's CA key
+      community.crypto.openssl_privatekey:
+        path: "{{ ferry_pki_dir }}/ca.key"
+        mode: "0600"
+        size: "{{ ferry_pki_key_size }}"
+        type: RSA
+
+    - name: Creating Ferry's CA certificate signing request
+      community.crypto.openssl_csr:
+        path: "{{ ferry_pki_dir }}/ca.csr"
+        privatekey_path: "{{ ferry_pki_dir }}/ca.key"
+        common_name: "ferry-{{ ferry_cloud_name }}-ca"
+        organization_name: "Ferry"
+        basic_constraints:
+          - "CA:TRUE"
+          - "pathlen:0"
+        basic_constraints_critical: true
+        key_usage:
+          - keyCertSign
+          - cRLSign
+        key_usage_critical: true
+        mode: "0600"
+
+    - name: Creating Ferry's CA certificate
+      community.crypto.x509_certificate:
+        path: "{{ ferry_pki_dir }}/ca.crt"
+        csr_path: "{{ ferry_pki_dir }}/ca.csr"
+        privatekey_path: "{{ ferry_pki_dir }}/ca.key"
+        provider: selfsigned
+        selfsigned_digest: sha256
+        selfsigned_not_after: "+{{ ferry_pki_valid_days }}d"
+        mode: "0644"
+
+    # The manager's mover listener. One certificate shared by every replica —
+    # they are identical, deliberately — so it has to name the VIP movers actually dial
+    # as well as each manager's own address.
+    - name: Creating the mover API server key
+      community.crypto.openssl_privatekey:
+        path: "{{ ferry_pki_dir }}/mover-api-server.key"
+        mode: "0600"
+        size: "{{ ferry_pki_key_size }}"
+        type: RSA
+      when: groups['ferry-manager'] | default([]) | length > 0
+
+    - name: Creating the mover API server certificate signing request
+      vars:
+        _san: >-
+          {{ ['IP:127.0.0.1']
+             + (['IP:' ~ kolla_internal_vip_address] if kolla_internal_vip_address | length > 0 else [])
+             + (groups['ferry-manager'] | map('extract', hostvars, ['ansible_facts', 'hostname']) | select() | map('regex_replace', '^', 'DNS:') | list)
+             + (ferry_manager_api_addresses | map('regex_replace', '^', 'IP:') | list) }}
+      community.crypto.openssl_csr:
+        path: "{{ ferry_pki_dir }}/mover-api-server.csr"
+        privatekey_path: "{{ ferry_pki_dir }}/mover-api-server.key"
+        common_name: "ferry-mover-api"
+        organization_name: "Ferry"
+        basic_constraints: ["CA:FALSE"]
+        basic_constraints_critical: true
+        key_usage: [digitalSignature, keyEncipherment]
+        key_usage_critical: true
+        extended_key_usage: [serverAuth]
+        subject_alt_name: "{{ _san | unique | list }}"
+        mode: "0600"
+      when: groups['ferry-manager'] | default([]) | length > 0
+      register: ferry_mover_api_csr
+
+    - name: Creating the mover API server certificate
+      community.crypto.x509_certificate:
+        path: "{{ ferry_pki_dir }}/mover-api-server.crt"
+        csr_path: "{{ ferry_pki_dir }}/mover-api-server.csr"
+        privatekey_path: "{{ ferry_pki_dir }}/mover-api-server.key"
+        ownca_path: "{{ ferry_pki_dir }}/ca.crt"
+        ownca_privatekey_path: "{{ ferry_pki_dir }}/ca.key"
+        ownca_digest: sha256
+        ownca_not_after: "+{{ ferry_pki_valid_days }}d"
+        provider: ownca
+        # The SAN list grows when a manager is added, and a certificate that
+        # does not name the new manager is a mover that cannot verify it.
+        force: "{{ ferry_mover_api_csr is changed }}"
+        mode: "0644"
+      when: groups['ferry-manager'] | default([]) | length > 0
+
+    # The managers' client identity towards ferry-compute. Shared by both
+    # replicas, because they must be indistinguishable.
+    - name: Creating the manager client key
+      community.crypto.openssl_privatekey:
+        path: "{{ ferry_pki_dir }}/manager-client.key"
+        mode: "0600"
+        size: "{{ ferry_pki_key_size }}"
+        type: RSA
+
+    - name: Creating the manager client certificate signing request
+      community.crypto.openssl_csr:
+        path: "{{ ferry_pki_dir }}/manager-client.csr"
+        privatekey_path: "{{ ferry_pki_dir }}/manager-client.key"
+        common_name: "{{ ferry_manager_client_cn }}"
+        organization_name: "Ferry"
+        basic_constraints: ["CA:FALSE"]
+        basic_constraints_critical: true
+        key_usage: [digitalSignature, keyEncipherment]
+        key_usage_critical: true
+        extended_key_usage: [clientAuth]
+        mode: "0600"
+
+    - name: Creating the manager client certificate
+      community.crypto.x509_certificate:
+        path: "{{ ferry_pki_dir }}/manager-client.crt"
+        csr_path: "{{ ferry_pki_dir }}/manager-client.csr"
+        privatekey_path: "{{ ferry_pki_dir }}/manager-client.key"
+        ownca_path: "{{ ferry_pki_dir }}/ca.crt"
+        ownca_privatekey_path: "{{ ferry_pki_dir }}/ca.key"
+        ownca_digest: sha256
+        ownca_not_after: "+{{ ferry_pki_valid_days }}d"
+        provider: ownca
+        mode: "0644"
+
+    # One certificate per mover, and the CN is the mover_id. The manager
+    # refuses a claim whose mover_id is not this CN, which is what stops a
+    # mover holding a valid certificate from claiming another mover's jobs and
+    # being handed its keys.
+    - name: Creating per-mover client keys
+      community.crypto.openssl_privatekey:
+        path: "{{ ferry_pki_dir }}/mover-{{ item }}.key"
+        mode: "0600"
+        size: "{{ ferry_pki_key_size }}"
+        type: RSA
+      loop: "{{ groups['ferry-mover'] | default([]) }}"
+      when: >-
+        ('mover-' ~ item ~ '.crt') not in ferry_pki_have
+        or ('mover-' ~ item ~ '.key') not in ferry_pki_have
+
+    - name: Creating per-mover certificate signing requests
+      community.crypto.openssl_csr:
+        path: "{{ ferry_pki_dir }}/mover-{{ item }}.csr"
+        privatekey_path: "{{ ferry_pki_dir }}/mover-{{ item }}.key"
+        common_name: "ferry-mover-{{ item }}"
+        organization_name: "Ferry"
+        basic_constraints: ["CA:FALSE"]
+        basic_constraints_critical: true
+        key_usage: [digitalSignature, keyEncipherment]
+        key_usage_critical: true
+        # A client certificate towards the manager, AND a server certificate for
+        # the file-level browse endpoint the manager dials back on.
+        #
+        # clientAuth alone was right while the mover only ever made outbound
+        # connections. FLR reverses one: the manager proxies a tenant's file
+        # listing to the mover holding the session, so that endpoint is a
+        # server, needs serverAuth, and needs to be verifiable at the address
+        # the mover advertises — an IP, which has to be a subjectAltName because
+        # a CN is not checked for one.
+        extended_key_usage: [clientAuth, serverAuth]
+        subject_alt_name: "{{ ['DNS:ferry-mover-' ~ item, 'DNS:' ~ item]
+                              + ['IP:' ~ ('api' | kolla_address(item))] }}"
+        mode: "0600"
+      loop: "{{ groups['ferry-mover'] | default([]) }}"
+      when: >-
+        ('mover-' ~ item ~ '.crt') not in ferry_pki_have
+        or ('mover-' ~ item ~ '.key') not in ferry_pki_have
+      register: ferry_mover_csrs
+
+    - name: Creating per-mover certificates
+      community.crypto.x509_certificate:
+        path: "{{ ferry_pki_dir }}/mover-{{ item }}.crt"
+        csr_path: "{{ ferry_pki_dir }}/mover-{{ item }}.csr"
+        privatekey_path: "{{ ferry_pki_dir }}/mover-{{ item }}.key"
+        ownca_path: "{{ ferry_pki_dir }}/ca.crt"
+        ownca_privatekey_path: "{{ ferry_pki_dir }}/ca.key"
+        ownca_digest: sha256
+        ownca_not_after: "+{{ ferry_pki_valid_days }}d"
+        provider: ownca
+        mode: "0644"
+        # Without this an existing certificate outlives the CSR that describes
+        # it, so a mover that gained the browse endpoint keeps the client-only
+        # certificate it was issued before — and the manager cannot verify it at
+        # the address it now advertises. Rewriting all of them when any CSR
+        # changes is the same trade the manager's own listener makes above:
+        # cheap, and the alternative is a certificate that silently does not
+        # match what it is used for.
+        force: "{{ ferry_mover_csrs is changed }}"
+      loop: "{{ groups['ferry-mover'] | default([]) }}"
+      when: >-
+        ('mover-' ~ item ~ '.crt') not in ferry_pki_have
+        or ('mover-' ~ item ~ '.key') not in ferry_pki_have
+
+    # ferry-compute's listener. The CN is the name Nova reports for the
+    # hypervisor, because that is the name the manager's quiesce client dials;
+    # the address is a SAN because manager.yaml maps the name onto it.
+    - name: Creating per-compute server keys
+      community.crypto.openssl_privatekey:
+        path: "{{ ferry_pki_dir }}/compute-{{ item }}.key"
+        mode: "0600"
+        size: "{{ ferry_pki_key_size }}"
+        type: RSA
+      loop: "{{ groups['ferry-compute'] | default([]) }}"
+      when: >-
+        ('compute-' ~ item ~ '.crt') not in ferry_pki_have
+        or ('compute-' ~ item ~ '.key') not in ferry_pki_have
+
+    - name: Creating per-compute certificate signing requests
+      community.crypto.openssl_csr:
+        path: "{{ ferry_pki_dir }}/compute-{{ item }}.csr"
+        privatekey_path: "{{ ferry_pki_dir }}/compute-{{ item }}.key"
+        common_name: "{{ hostvars[item].ansible_facts.hostname }}"
+        organization_name: "Ferry"
+        basic_constraints: ["CA:FALSE"]
+        basic_constraints_critical: true
+        key_usage: [digitalSignature, keyEncipherment]
+        key_usage_critical: true
+        extended_key_usage: [serverAuth]
+        subject_alt_name:
+          - "DNS:{{ hostvars[item].ansible_facts.hostname }}"
+          - "IP:{{ 'api' | kolla_address(item) }}"
+          - "IP:127.0.0.1"
+        mode: "0600"
+      loop: "{{ groups['ferry-compute'] | default([]) }}"
+      when: >-
+        ('compute-' ~ item ~ '.crt') not in ferry_pki_have
+        or ('compute-' ~ item ~ '.key') not in ferry_pki_have
+
+    - name: Creating per-compute server certificates
+      community.crypto.x509_certificate:
+        path: "{{ ferry_pki_dir }}/compute-{{ item }}.crt"
+        csr_path: "{{ ferry_pki_dir }}/compute-{{ item }}.csr"
+        privatekey_path: "{{ ferry_pki_dir }}/compute-{{ item }}.key"
+        ownca_path: "{{ ferry_pki_dir }}/ca.crt"
+        ownca_privatekey_path: "{{ ferry_pki_dir }}/ca.key"
+        ownca_digest: sha256
+        ownca_not_after: "+{{ ferry_pki_valid_days }}d"
+        provider: ownca
+        mode: "0644"
+      loop: "{{ groups['ferry-compute'] | default([]) }}"
+      when: >-
+        ('compute-' ~ item ~ '.crt') not in ferry_pki_have
+        or ('compute-' ~ item ~ '.key') not in ferry_pki_have
+
+# The KEK. `file` means a key on the manager hosts and nothing else knows
+# it, which is fine for one cloud and is a real limitation across two: a point
+# written under this KEK cannot be decrypted by a manager that cannot read the
+# file, so cross-cloud restore out of that repository does not work.
+# No KEK is minted here. The key that wraps every per-domain DEK lives in
+# Barbican or Vault (see defaults/main.yml), and provisioning it is an
+# operator action with a trail rather than a side effect of a deploy.

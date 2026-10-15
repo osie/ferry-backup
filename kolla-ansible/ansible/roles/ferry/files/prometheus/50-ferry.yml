@@ -1,0 +1,15 @@
+scrape_configs:
+{% set ferry_scrape = [
+     ('ferry_manager', 'ferry-manager', ferry_admin_port | default('9775')),
+     ('ferry_mover', 'ferry-mover', ferry_mover_admin_port | default('9782')),
+     ('ferry_compute', 'ferry-compute', ferry_compute_admin_port | default('9780'))] %}
+{% for job, group, port in ferry_scrape if group in groups and groups[group] | length > 0 %}
+  - job_name: {{ job }}
+    static_configs:
+      - targets:
+{% for host in groups[group] %}
+        - '{{ 'api' | kolla_address(host) | put_address_in_context('url') }}:{{ port }}'
+{% endfor %}
+{% else %}
+  []
+{% endfor %}

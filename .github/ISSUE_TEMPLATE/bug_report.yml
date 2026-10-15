@@ -1,0 +1,53 @@
+name: Bug report
+description: Something in the manifests or the guides does not work as described
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting. Security problems go through the repository's
+        Security tab, not here; see SECURITY.md.
+  - type: dropdown
+    id: deployer
+    attributes:
+      label: Deployer
+      options:
+        - kolla-ansible
+        - Helm
+        - Juju (Charmed OpenStack)
+        - Juju (Sunbeam)
+    validations:
+      required: true
+  - type: input
+    id: versions
+    attributes:
+      label: Versions
+      description: Ferry (image tag), the deployer and the OpenStack release.
+      placeholder: "Ferry 0.17.0, kolla-ansible 2025.1, OpenStack 2025.1"
+    validations:
+      required: true
+  - type: input
+    id: preset
+    attributes:
+      label: Helm preset or distribution
+      placeholder: "openstack-helm, rhoso, yaook, ..."
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you ran, what happened, and what you expected instead.
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Output or logs
+      description: The failing task or pod log. Remove anything you would not want public.
+      render: text
+  - type: textarea
+    id: bundle
+    attributes:
+      label: Support bundle summary
+      description: |
+        The summary.md of `ferry admin support-bundle` (see docs/support-bundle.md),
+        if Ferry is running. It leaves credentials and tenant data out.

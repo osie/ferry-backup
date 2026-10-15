@@ -1,0 +1,3 @@
+---
+- name: Deploy ferry
+  ansible.builtin.import_tasks: deploy.yml

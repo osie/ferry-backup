@@ -1,0 +1,15 @@
+apiVersion: v2
+name: ferry
+description: Ferry backup, recovery and DRaaS for OpenStack, on any Kubernetes-hosted OpenStack
+type: application
+version: 0.17.0
+appVersion: "0.17.0"
+kubeVersion: ">=1.25.0-0"
+home: https://github.com/osie/ferry-deploy
+sources:
+  - https://github.com/osie/ferry-deploy
+keywords:
+  - openstack
+  - backup
+  - disaster-recovery
+  - openstack-helm

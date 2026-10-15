@@ -1,0 +1,53 @@
+---
+# The manager applies its own migrations at startup and Migrate's checksum
+# guard refuses a mismatched binary/schema pair loudly, so there is no separate
+# bootstrap container to run. What an upgrade does have to respect is ordering:
+# an old binary must not meet a schema a newer one has migrated, which is why
+# the managers are stopped before the new image is configured in.
+- name: Stop ferry-manager containers before migrating
+  vars:
+    service: "{{ ferry_services['ferry-manager'] }}"
+  become: true
+  kolla_container:
+    action: "stop_container"
+    common_options: "{{ docker_common_options }}"
+    name: "{{ service.container_name }}"
+    ignore_missing: true
+  when: service | service_enabled_and_mapped_to_host
+
+# An upgrade is also where a deployment turns something on for the first time,
+# and the host state has to be there before the config that names it. Without
+# this, enabling the local-disk path on an upgrade renders an agent config
+# pointing at directories nothing has created with the right owner, and the
+# first backup fails inside QEMU rather than at deploy time. Idempotent, so it
+# costs an upgrade that changes nothing almost nothing.
+- name: Configure the hosts
+  ansible.builtin.import_tasks: config-host.yml
+
+- name: Generate Ferry's PKI
+  ansible.builtin.import_tasks: pki.yml
+
+# Not to mint one — an upgrade already has a credential — but to LOAD its id.
+#
+# The id is recorded on the deploy host and read back into a variable here, and
+# manager.yaml is rendered from that variable. Skipping this does not leave the
+# old value in place: it renders a manager config with no application
+# credential at all, and ferry-manager refuses to start without one (service-account
+# passwords are ruled out). So an upgrade that skipped it took
+# every manager in the cloud down, at the one moment an operator is least able
+# to tell an upgrade bug from a broken release.
+- name: Load ferry's application credential
+  ansible.builtin.import_tasks: appcred.yml
+
+# Before config.yml, which renders the manager's objects stanza from it.
+- name: Load ferry's RGW gateway credential
+  ansible.builtin.import_tasks: objects.yml
+
+- name: Configure ferry
+  ansible.builtin.import_tasks: config.yml
+
+- name: Check ferry containers
+  ansible.builtin.import_tasks: check-containers.yml
+
+- name: Flush handlers
+  ansible.builtin.meta: flush_handlers

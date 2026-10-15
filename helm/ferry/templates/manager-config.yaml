@@ -1,0 +1,183 @@
+{{- define "ferry.managerConfig" -}}
+mode: local
+cloud_name: {{ include "ferry.cloudName" . | quote }}
+site_name: {{ include "ferry.siteName" . | quote }}
+log:
+  level: {{ .Values.logLevel | quote }}
+  format: json
+api:
+  bind: "0.0.0.0:9776"
+  tls:
+    enabled: false
+mover_api:
+  bind: "0.0.0.0:9777"
+  tls:
+    enabled: true
+    cert_file: /etc/ferry/pki/mover-api-server/tls.crt
+    key_file: /etc/ferry/pki/mover-api-server/tls.key
+    client_ca_file: /etc/ferry/pki/mover-api-server/ca.crt
+    require_client_cert: true
+    allowed_client_cns:
+      - {{ printf "%s-*" (include "ferry.moverName" .) | quote }}
+    min_version: "1.3"
+admin:
+  enabled: true
+  bind: {{ ternary "0.0.0.0:9775" "127.0.0.1:9775" .Values.metrics.enabled | quote }}
+  metrics: true
+  pprof: false
+db:
+  migrate: true
+  assert_version: true
+keystone:
+  auth_url: {{ .Values.keystone.authUrl | quote }}
+  {{- if .Values.keystone.applicationCredentialId }}
+  application_credential_id: {{ .Values.keystone.applicationCredentialId | quote }}
+  {{- else }}
+  application_credential_name: {{ .Values.keystone.applicationCredentialName | quote }}
+  {{- end }}
+  username: {{ .Values.keystone.user | quote }}
+  user_domain_name: {{ .Values.keystone.userDomain | quote }}
+  project_name: {{ .Values.keystone.project | quote }}
+  project_domain_name: {{ .Values.keystone.projectDomain | quote }}
+  region: {{ .Values.keystone.region | quote }}
+  interface: {{ .Values.keystone.interface | quote }}
+  restore_trust_ttl: {{ .Values.keystone.restoreTrustTTL | quote }}
+  {{- if .Values.keystone.caSecret }}
+  ca_cert: /etc/ferry/keystone-ca/ca.crt
+  {{- end }}
+  register_in_catalog: {{ .Values.keystone.catalog.register }}
+  service_name: {{ .Values.keystone.catalog.serviceName | quote }}
+  service_type: {{ .Values.keystone.catalog.serviceType | quote }}
+  public_url: {{ include "ferry.publicUrl" . | quote }}
+  internal_url: {{ include "ferry.internalUrl" . | quote }}
+  admin_url: {{ include "ferry.internalUrl" . | quote }}
+kms:
+  driver: {{ .Values.kms.driver | quote }}
+  {{- if eq .Values.kms.driver "barbican" }}
+  barbican:
+    secret_id: {{ required "kms.barbican.secretId is required with the barbican driver" .Values.kms.barbican.secretId | quote }}
+  {{- else if eq .Values.kms.driver "vault" }}
+  vault:
+    address: {{ required "kms.vault.address is required with the vault driver" .Values.kms.vault.address | quote }}
+    mount: {{ .Values.kms.vault.mount | quote }}
+    key_name: {{ .Values.kms.vault.keyName | quote }}
+    token_file: /etc/ferry/vault/token
+  {{- end }}
+{{- if .Values.ceph.enabled }}
+ceph:
+  conf: /etc/ceph/ceph.conf
+  user: {{ .Values.ceph.users.manager | quote }}
+  volume_pools: {{ .Values.ceph.pools.volumes | toJson }}
+  vm_pools: {{ .Values.ceph.pools.vms | toJson }}
+  remove_nova_orphans: {{ dig "removeNovaOrphans" false .Values.ceph }}
+  volume_name_template: {{ .Values.ceph.volumeNameTemplate | quote }}
+  mover:
+    user: {{ .Values.ceph.users.mover | quote }}
+    keyring: {{ printf "/etc/ceph/ceph.client.%s.keyring" .Values.ceph.users.mover | quote }}
+  restore:
+    user: {{ .Values.ceph.users.restore | quote }}
+    keyring: {{ printf "/etc/ceph/ceph.client.%s.keyring" .Values.ceph.users.restore | quote }}
+  mirror:
+    drive_schedule: {{ dig "driveSchedule" false (.Values.ceph.mirror | default dict) }}
+    enable_images: {{ dig "enableImages" false (.Values.ceph.mirror | default dict) }}
+{{- else }}
+ceph:
+  conf: ""
+  volume_pools: []
+  vm_pools: []
+{{- end }}
+{{- if .Values.compute.enabled }}
+compute:
+  enabled: true
+  scheme: https
+  port: {{ .Values.compute.port }}
+  timeout: 30s
+  max_freeze: {{ .Values.compute.maxFreeze | quote }}
+  warn_above: 2s
+  require_quiesce: {{ .Values.compute.requireQuiesce }}
+  hosts_from_nova: true
+  {{- with .Values.compute.hosts }}
+  hosts:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  local_disk:
+    enabled: {{ .Values.compute.localDiskBackup }}
+    {{- if .Values.compute.localDiskBackup }}
+    cache_ttl: 1m
+    session_ttl: 30m
+    {{- end }}
+  tls:
+    cert_file: /etc/ferry/pki/manager-client/tls.crt
+    key_file: /etc/ferry/pki/manager-client/tls.key
+    ca_file: /etc/ferry/pki/manager-client/ca.crt
+    {{- with include "ferry.computeTLSServerName" . }}
+    server_name: {{ . | quote }}
+    {{- end }}
+{{- end }}
+limits:
+  max_concurrent_reads_per_pool: {{ .Values.limits.maxConcurrentReadsPerPool }}
+  osd_client_op_priority: {{ .Values.limits.osdClientOpPriority }}
+  read_parallelism: {{ .Values.limits.readParallelism }}
+  upload_parallelism: {{ .Values.limits.uploadParallelism }}
+  max_inflight_jobs: {{ .Values.limits.maxInflightJobs }}
+  pause_when_degraded: {{ .Values.limits.pauseWhenDegraded }}
+{{- with .Values.cloud.timezone }}
+retention:
+  timezone: {{ . | quote }}
+{{- end }}
+gc:
+  grace_period: {{ .Values.gc.gracePeriod | quote }}
+dr:
+  enabled: {{ dig "enabled" false (.Values.dr | default dict) }}
+  run_deadline: {{ dig "runDeadline" "12h" (.Values.dr | default dict) | quote }}
+  probe:
+    image: {{ dig "probe" "image" "" (.Values.dr | default dict) | quote }}
+    flavor: {{ dig "probe" "flavor" "" (.Values.dr | default dict) | quote }}
+    direct: {{ dig "probe" "direct" false (.Values.dr | default dict) }}
+shutdown:
+  drain: 30s
+  grace: 15s
+{{- with .Values.console }}
+{{- if and (or .logo .logoDark .favicon .stylesheet) (not .filesConfigMap) }}
+{{- fail "console.filesConfigMap is required once console.logo, logoDark, favicon or stylesheet names a file: it is the ConfigMap those files are read from" }}
+{{- end }}
+{{- if or .productName .primaryColor .logo .logoDark .favicon .stylesheet }}
+console:
+  {{- with .productName }}
+  product_name: {{ . | quote }}
+  {{- end }}
+  {{- with .primaryColor }}
+  primary_color: {{ . | quote }}
+  {{- end }}
+  {{- with .primaryColorDark }}
+  primary_color_dark: {{ . | quote }}
+  {{- end }}
+  {{- range $key, $name := dict "logo" .logo "logo_dark" .logoDark "favicon" .favicon "stylesheet" .stylesheet }}
+  {{- if $name }}
+  {{ $key }}: {{ printf "/etc/ferry/console/%s" $name | quote }}
+  {{- end }}
+  {{- end }}
+  {{- if .logoOnly }}
+  logo_only: true
+  {{- with .logoAlign }}
+  logo_align: {{ . | quote }}
+  {{- end }}
+  {{- if gt (int .logoHeight) 0 }}
+  logo_height: {{ int .logoHeight }}
+  {{- end }}
+  {{- if gt (int .logoWidth) 0 }}
+  logo_width: {{ int .logoWidth }}
+  {{- end }}
+  {{- end }}
+{{- end }}
+{{- end }}
+{{- end -}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "ferry.fullname" . }}-manager
+  labels:
+    {{- include "ferry.componentLabels" (dict "root" . "component" "manager") | nindent 4 }}
+data:
+  manager.yaml: |
+    {{- mergeOverwrite (include "ferry.managerConfig" . | fromYaml) (deepCopy .Values.manager.extraConfig) | toYaml | nindent 4 }}

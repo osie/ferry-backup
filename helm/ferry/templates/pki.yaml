@@ -1,0 +1,93 @@
+{{- if eq .Values.pki.provider "cert-manager" }}
+{{- $full := include "ferry.fullname" . }}
+{{- $cm := .Values.pki.certManager }}
+{{- $issuer := $cm.issuerRef }}
+{{- if not $issuer }}
+{{- $issuer = dict "name" (printf "%s-ca" $full) "kind" "Issuer" }}
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  name: {{ $full }}-selfsigned
+  labels:
+    {{- include "ferry.labels" . | nindent 4 }}
+spec:
+  selfSigned: {}
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: {{ $full }}-ca
+  labels:
+    {{- include "ferry.labels" . | nindent 4 }}
+spec:
+  isCA: true
+  commonName: {{ printf "ferry-%s-ca" (include "ferry.cloudName" .) | quote }}
+  secretName: {{ $full }}-ca
+  duration: 87600h
+  renewBefore: 8760h
+  privateKey:
+    algorithm: ECDSA
+    size: 256
+    rotationPolicy: Never
+  issuerRef:
+    name: {{ $full }}-selfsigned
+    kind: Issuer
+    group: cert-manager.io
+---
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  name: {{ $full }}-ca
+  labels:
+    {{- include "ferry.labels" . | nindent 4 }}
+    {{- with $cm.issuerLabels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  ca:
+    secretName: {{ $full }}-ca
+---
+{{- end }}
+{{- $certs := list }}
+{{- $svc := include "ferry.moverApiService" . }}
+{{- $certs = append $certs (dict "name" "mover-api-server" "cn" "ferry-mover-api" "usages" (list "server auth" "digital signature" "key encipherment") "dns" (list $svc (printf "%s.%s" $svc .Release.Namespace) (printf "%s.%s.svc" $svc .Release.Namespace) (printf "%s.%s.svc.cluster.local" $svc .Release.Namespace))) }}
+{{- if .Values.compute.enabled }}
+{{- $certs = append $certs (dict "name" "manager-client" "cn" (include "ferry.managerClientCN" .) "usages" (list "client auth" "digital signature" "key encipherment") "dns" (list)) }}
+{{- if or .Values.compute.daemonset .Values.compute.edpm.enabled }}
+{{- $certs = append $certs (dict "name" "compute-server" "cn" (include "ferry.computeServerName" .) "usages" (list "server auth" "digital signature" "key encipherment") "dns" (list (include "ferry.computeServerName" .))) }}
+{{- end }}
+{{- end }}
+{{- range $id := include "ferry.moverIdentities" . | fromJsonArray }}
+{{- $certs = append $certs (dict "name" (trimPrefix (printf "%s-" $full) $id) "cn" $id "usages" (list "client auth" "digital signature" "key encipherment") "dns" (list)) }}
+{{- end }}
+{{- range $i, $c := $certs }}
+{{- if $i }}
+---
+{{- end }}
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: {{ $full }}-{{ $c.name }}
+  labels:
+    {{- include "ferry.labels" $ | nindent 4 }}
+spec:
+  commonName: {{ $c.cn | quote }}
+  secretName: {{ $full }}-{{ $c.name }}
+  duration: {{ $cm.duration }}
+  renewBefore: {{ $cm.renewBefore }}
+  privateKey:
+    algorithm: ECDSA
+    size: 256
+    rotationPolicy: Always
+  usages:
+    {{- toYaml $c.usages | nindent 4 }}
+  {{- with $c.dns }}
+  dnsNames:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  issuerRef:
+    name: {{ $issuer.name }}
+    kind: {{ default "Issuer" $issuer.kind }}
+    group: {{ default "cert-manager.io" $issuer.group }}
+{{- end }}
+{{- end }}

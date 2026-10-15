@@ -1,0 +1,175 @@
+---
+# Host-level state a mover in the storage fabric needs before it can attach a
+# Cinder volume to itself.
+#
+# Only the fabric movers. A mover that reads Ceph needs none of this, and most
+# of them are that kind — which is why this is keyed on a group of its own
+# rather than on ferry-mover.
+#
+# Loaded and persisted through kolla's own module-load role, which is how every
+# other service here gets a kernel module: nova-cell takes br_netfilter this
+# way, the iscsi role takes configfs, neutron and openvswitch the same. Using it
+# means a reboot does not quietly remove Ferry's ability to attach a LUN,
+# because module-load writes /etc/modules-load.d as well as modprobing.
+
+- name: Load and persist the iSCSI transport module
+  ansible.builtin.include_role:
+    name: module-load
+  vars:
+    modules:
+      # Without it iscsiadm can log in to nothing and reports "iSCSI driver not
+      # found", which reads like a fabric or credentials problem and is neither.
+      # Ferry cannot load it from inside a container, so it is the host's to
+      # provide.
+      - name: iscsi_tcp
+  when:
+    - inventory_hostname in groups['ferry-mover-fabric'] | default([])
+    - ferry_fabric_iscsi | bool
+
+# NVMe-oF's transport, and the one thing that has to be on the host rather than
+# in the image. Without it `nvme connect -t tcp` has nothing to connect through.
+#
+# nvme_fabrics comes with it as a dependency. On Ubuntu both live in
+# linux-modules-extra, which is not installed by default — the precheck says so
+# rather than leaving a modprobe to fail here.
+- name: Load and persist the NVMe-oF transport module
+  ansible.builtin.include_role:
+    name: module-load
+  vars:
+    modules:
+      - name: nvme_tcp
+  when:
+    - inventory_hostname in groups['ferry-mover-fabric'] | default([])
+    - ferry_fabric_nvmeof | bool
+
+- name: Load and persist the multipath module
+  ansible.builtin.include_role:
+    name: module-load
+  vars:
+    modules:
+      - name: dm_multipath
+  when:
+    - inventory_hostname in groups['ferry-mover-fabric'] | default([])
+    - ferry_fabric_multipath | bool
+
+- name: Create the connector's lock directory
+  become: true
+  ansible.builtin.file:
+    path: "{{ ferry_fabric_lock_dir }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0750"
+  when:
+    - inventory_hostname in groups['ferry-mover-fabric'] | default([])
+
+# The initiator name is deliberately NOT written here.
+#
+# /etc/iscsi is a volume in the mover container, not a host path — kolla's own
+# convention, so that a host running kolla's iscsid has exactly one initiator
+# name and one daemon that agree about it. Writing the host's /etc/iscsi would
+# produce a second name that nothing reads. The mover's entrypoint seeds the
+# volume instead, on the one path where nothing else has.
+
+# The scratch and socket directories for the local-disk data path, and their
+# ownership is the whole point of doing it here.
+#
+# QEMU is what opens these — it creates the copy-before-write scratch and binds
+# the NBD socket — and kolla runs QEMU as `nova`, a member of the `qemu` group.
+# ferry-compute runs as root and would otherwise create them 0700 root:root on
+# first start, which QEMU cannot even traverse. The failure lands mid-backup as
+# a blockdev-add "No such file or directory" naming a file the agent has just
+# successfully created, which is a long way from its cause.
+#
+# Inside libvirt's own state directory, because that is the one place both
+# processes can name: libvirt and QEMU run in nova_libvirt, so a host path only
+# this agent can see does not exist as far as QEMU is concerned.
+- name: Find the libvirt state directory
+  become: true
+  ansible.builtin.command:
+    # Plain JSON rather than --format: a Go template is two braces the command
+    # module splits into separate arguments, and it needs a shell it does not get.
+    cmd: "{{ kolla_container_engine }} volume inspect {{ ferry_libvirt_volume }}"
+  changed_when: false
+  register: ferry_libvirt_volume_info
+  when:
+    - inventory_hostname in groups['ferry-compute'] | default([])
+    - ferry_local_disk_backup | bool
+    - not ferry_libvirt_volume.startswith('/')
+
+# Asked of the container rather than assumed, because being wrong here is
+# silent: the directories are created, everything reports success, and QEMU
+# cannot write to them. Where the container is not up yet — a first deploy —
+# kolla's fixed ids are the answer, and this is a no-op.
+- name: Reading the hypervisor's user from nova_libvirt
+  become: true
+  ansible.builtin.command:
+    cmd: "{{ kolla_container_engine }} exec nova_libvirt id -u qemu"
+  changed_when: false
+  failed_when: false
+  register: ferry_qemu_uid_probe
+  when:
+    - inventory_hostname in groups['ferry-compute'] | default([])
+    - ferry_local_disk_backup | bool
+
+- name: Reading the hypervisor's group from nova_libvirt
+  become: true
+  ansible.builtin.command:
+    cmd: "{{ kolla_container_engine }} exec nova_libvirt id -g qemu"
+  changed_when: false
+  failed_when: false
+  register: ferry_qemu_gid_probe
+  when:
+    - inventory_hostname in groups['ferry-compute'] | default([])
+    - ferry_local_disk_backup | bool
+
+- name: Create the backup scratch and socket directories
+  become: true
+  vars:
+    # Where the volume actually is on this host, so the same configured path
+    # names one directory whether libvirt runs in a container or on the host.
+    ferry_libvirt_state_dir: "{{ (ferry_libvirt_volume_info.stdout | from_json)[0].Mountpoint
+                                 if ferry_libvirt_volume_info.stdout | default('') else ferry_libvirt_volume }}"
+  ansible.builtin.file:
+    path: "{{ ferry_libvirt_state_dir }}/{{ item | regex_replace('^/var/lib/libvirt/', '') }}"
+    state: directory
+    owner: "{{ ferry_qemu_uid_probe.stdout | default('') | trim or ferry_qemu_uid }}"
+    group: "{{ ferry_qemu_gid_probe.stdout | default('') | trim or ferry_qemu_gid }}"
+    # Group-writable, not world: nova reaches it through the qemu group, and
+    # nothing else on the host has any business there.
+    mode: "0770"
+  loop:
+    - "{{ ferry_compute_scratch_dir }}"
+    - "{{ ferry_compute_socket_dir }}"
+  when:
+    - inventory_hostname in groups['ferry-compute'] | default([])
+    - ferry_local_disk_backup | bool
+
+- name: Ensuring the ferry-mover unit's drop-in directory exists
+  vars:
+    service: "{{ ferry_services['ferry-mover'] }}"
+  become: true
+  ansible.builtin.file:
+    path: "/etc/systemd/system/kolla-{{ service.container_name }}-container.service.d"
+    state: directory
+    mode: "0755"
+  when: service | service_enabled_and_mapped_to_host
+
+- name: Giving the ferry-mover unit a stop timeout longer than its drain
+  vars:
+    service: "{{ ferry_services['ferry-mover'] }}"
+  become: true
+  ansible.builtin.copy:
+    dest: "/etc/systemd/system/kolla-{{ service.container_name }}-container.service.d/ferry-stop.conf"
+    content: |
+      [Service]
+      TimeoutStopSec={{ service.client_timeout }}
+    mode: "0644"
+  register: ferry_mover_stop_unit
+  when: service | service_enabled_and_mapped_to_host
+
+- name: Reloading systemd for the ferry-mover unit's stop timeout
+  become: true
+  ansible.builtin.systemd:
+    daemon_reload: true
+  when: ferry_mover_stop_unit is changed

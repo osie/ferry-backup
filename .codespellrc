@@ -1,0 +1,3 @@
+[codespell]
+skip = ./.git,./dist,./.venv*,*.sum,./LICENSE
+check-hidden = true

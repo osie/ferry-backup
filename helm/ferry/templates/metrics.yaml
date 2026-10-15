@@ -1,0 +1,81 @@
+{{- if .Values.metrics.enabled }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "ferry.fullname" . }}-manager-admin
+  labels:
+    {{- include "ferry.componentLabels" (dict "root" . "component" "manager") | nindent 4 }}
+spec:
+  clusterIP: None
+  selector:
+    {{- include "ferry.selector" (dict "root" . "component" "manager") | nindent 4 }}
+  ports:
+    - name: admin
+      port: 9775
+      targetPort: admin
+{{- end }}
+{{- if .Values.metrics.serviceMonitor.enabled }}
+{{- if not .Values.metrics.enabled }}
+{{- fail "metrics.serviceMonitor.enabled needs metrics.enabled: without it the managers and the compute agents keep their admin listeners on loopback, where Prometheus cannot reach them" }}
+{{- end }}
+{{- range $component := list "manager" "mover" }}
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: {{ include "ferry.fullname" $ }}-{{ $component }}
+  labels:
+    {{- include "ferry.componentLabels" (dict "root" $ "component" $component) | nindent 4 }}
+    {{- with $.Values.metrics.serviceMonitor.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  selector:
+    matchLabels:
+      {{- include "ferry.selector" (dict "root" $ "component" $component) | nindent 6 }}
+  endpoints:
+    - port: admin
+      path: /metrics
+      relabelings:
+        - targetLabel: job
+          replacement: {{ printf "ferry_%s" $component }}
+        - action: labeldrop
+          regex: pod
+{{- end }}
+{{- if and .Values.compute.enabled .Values.compute.daemonset }}
+---
+apiVersion: monitoring.coreos.com/v1
+kind: PodMonitor
+metadata:
+  name: {{ include "ferry.fullname" . }}-compute
+  labels:
+    {{- include "ferry.componentLabels" (dict "root" . "component" "compute") | nindent 4 }}
+    {{- with .Values.metrics.serviceMonitor.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  selector:
+    matchLabels:
+      {{- include "ferry.selector" (dict "root" . "component" "compute") | nindent 6 }}
+  podMetricsEndpoints:
+    - port: admin
+      path: /metrics
+      relabelings:
+        - targetLabel: job
+          replacement: ferry_compute
+{{- end }}
+{{- end }}
+{{- if .Values.metrics.prometheusRule.enabled }}
+---
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: {{ include "ferry.fullname" . }}
+  labels:
+    {{- include "ferry.labels" . | nindent 4 }}
+    {{- with .Values.metrics.prometheusRule.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  {{- .Files.Get "files/ferry.rules" | nindent 2 }}
+{{- end }}

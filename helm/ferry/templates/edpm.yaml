@@ -1,0 +1,56 @@
+{{- if and .Values.compute.enabled .Values.compute.edpm.enabled }}
+{{- $full := include "ferry.fullname" . }}
+{{- $e := .Values.compute.edpm }}
+{{- $config := mergeOverwrite (include "ferry.computeConfig" . | fromYaml) (dict "libvirt" (dict "socket" $e.libvirtSocket)) (deepCopy .Values.compute.extraConfig) }}
+{{- $playbook := .Files.Get "files/edpm-compute.yml"
+  | replace "__SERVICE__" $e.serviceName
+  | replace "__SCRATCH__" .Values.compute.scratchDir
+  | replace "__SOCKETS__" .Values.compute.socketDir
+  | replace "__QEMU_UID__" (toString $e.qemu.uid)
+  | replace "__QEMU_GID__" (toString $e.qemu.gid)
+  | replace "__PORT__" (toString .Values.compute.port)
+  | replace "__IMAGE__" .Values.images.compute }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ $full }}-edpm-compute
+  labels:
+    {{- include "ferry.componentLabels" (dict "root" . "component" "compute") | nindent 4 }}
+data:
+  compute.yaml: |
+    {{- toYaml $config | nindent 4 }}
+---
+apiVersion: dataplane.openstack.org/v1beta1
+kind: OpenStackDataPlaneService
+metadata:
+  name: {{ $e.serviceName }}
+  labels:
+    {{- include "ferry.componentLabels" (dict "root" . "component" "compute") | nindent 4 }}
+spec:
+  edpmServiceType: {{ $e.serviceName }}
+  dataSources:
+    - configMapRef:
+        name: {{ $full }}-edpm-compute
+    - secretRef:
+        name: {{ include "ferry.pkiSecret" (dict "root" . "name" "compute-server") }}
+  playbookContents: |
+    {{- $playbook | nindent 4 }}
+{{- if $e.deploy }}
+---
+apiVersion: dataplane.openstack.org/v1beta1
+kind: OpenStackDataPlaneDeployment
+metadata:
+  name: {{ $full }}-edpm
+  labels:
+    {{- include "ferry.componentLabels" (dict "root" . "component" "compute") | nindent 4 }}
+  annotations:
+    helm.sh/hook: post-install,post-upgrade
+    helm.sh/hook-delete-policy: before-hook-creation
+    ferry.osie.io/playbook: {{ printf "%s%s" $playbook (toYaml $config) | sha256sum | trunc 16 | quote }}
+spec:
+  nodeSets:
+    {{- toYaml (required "compute.edpm.nodeSets names the NodeSets to deploy the agent to" $e.nodeSets) | nindent 4 }}
+  servicesOverride:
+    - {{ $e.serviceName }}
+{{- end }}
+{{- end }}

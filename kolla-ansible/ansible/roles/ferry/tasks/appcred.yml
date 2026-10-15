@@ -1,0 +1,190 @@
+---
+# Ferry's own Keystone credential.
+#
+# Not optional and not a preference: the manager validates tenant tokens with
+# an application credential, and ferry-manager refuses to start with only a
+# service-account password. So the role mints one — kolla has no other service
+# that needs this, which is why nothing upstream does it.
+#
+# An application credential rather than the service password because it carries
+# a restricted role list, is unrestricted=False, and is revocable on its own
+# without rotating the account. The deployed manager only ever sees this; the
+# service password stays on the deploy host.
+#
+# Two awkward properties of Keystone and the ansible module shape this:
+#
+#   Keystone has no way to re-read a secret. So the secret is SUPPLIED rather
+#   than generated — it comes from passwords.yml like every other kolla secret
+#   — which means recreating the credential does not invalidate the deployed
+#   configuration.
+#
+#   openstack.cloud.application_credential deletes and recreates on every run,
+#   because application credentials are immutable. The id would therefore
+#   change on every deploy, rewriting manager.yaml and restarting the manager
+#   for no reason. So it runs only when we have no id recorded, and the id is
+#   kept on the deploy host beside the PKI.
+#
+# To rotate: delete the file named below and re-run.
+
+# Not become, matching pki.yml: everything the role writes on the deploy host is
+# owned by the user running kolla-ansible, because ansible's `copy` reads src on
+# the CONTROLLER as that user and cannot read root-only files.
+# create-cephx.sh needs root and hands its output back for the same reason.
+#
+# NOTE ON ansible_become. Every task below that runs on the DEPLOY HOST sets
+# `vars: {ansible_become: false}`, not just `become: false`. kolla's own
+# multinode inventory carries `ansible_become=true` in [all:vars], and for a
+# delegate_to: localhost task that connection variable beats the task's become —
+# so the PKI and the credential id land root-owned. ansible then reads `src` and
+# include_vars on the CONTROLLER as the user running kolla-ansible, which cannot
+# read them back, and the deploy fails with "Could not find or access" after the
+# work has already been done.
+
+- name: Ensuring Ferry's state directory exists on the deploy host
+  run_once: true
+  delegate_to: localhost
+  vars:
+    ansible_become: false
+  become: false
+  ansible.builtin.file:
+    path: "{{ ferry_appcred_file | dirname }}"
+    state: directory
+    mode: "0755"
+
+- name: Checking for a recorded application credential
+  run_once: true
+  delegate_to: localhost
+  vars:
+    ansible_become: false
+  become: false
+  ansible.builtin.stat:
+    path: "{{ ferry_appcred_file }}"
+  register: ferry_appcred_stat
+
+- name: Creating Ferry's application credential
+  run_once: true
+  when:
+    - not ferry_appcred_stat.stat.exists
+    - ferry_keystone_application_credential_id | length == 0
+  block:
+    # Created BY the ferry user FOR itself, which is what an application
+    # credential is. That is also why service-ks-register has to have run
+    # first, and why the roles requested here have to be roles that user
+    # already holds on the service project.
+    # The CLI, not openstack.cloud.application_credential, and not by choice.
+    #
+    # That module cannot work under kolla-ansible before 2026.1, for two
+    # independent reasons found on a live Epoxy cloud:
+    #
+    #   Its _get_cloud_config() runs AFTER creating the credential and calls
+    #   openstack.config.get_one(self.cloud) — resolving a NAMED clouds.yaml
+    #   entry and ignoring the `auth` dict entirely. The kolla_toolbox container
+    #   ships no clouds.yaml, so that call raises "Auth plugin requires
+    #   parameters which were not given: auth_url" — after the credential has
+    #   already been created, leaving one behind on every run.
+    #
+    #   Its `roles` parameter is a list of dicts, and kolla_toolbox stringifies
+    #   module_args before 2026.1: a list arrives as Python repr and fails the
+    #   module's elements=dict coercion.
+    #
+    # The CLI has neither problem. Every argument is a string, --role repeats,
+    # and -f json gives the id directly. The credential it produces is identical
+    # — verified against one made by the module.
+    # `<engine> exec kolla_toolbox openstack ...`, rather than the kolla_toolbox
+    # module, and not by choice. Three things rule out the alternatives:
+    #
+    #   openstack.cloud.application_credential cannot work before 2026.1. Its
+    #   _get_cloud_config() runs AFTER creating the credential and calls
+    #   openstack.config.get_one(self.cloud), which resolves a NAMED clouds.yaml
+    #   entry and ignores the `auth` dict entirely. The toolbox ships no
+    #   clouds.yaml, so it raises "Auth plugin requires parameters which were
+    #   not given: auth_url" — having already created the credential, leaving
+    #   one behind on every run.
+    #
+    #   Its `roles` parameter is a list of dicts, and kolla_toolbox stringifies
+    #   module_args before 2026.1, so a list arrives as Python repr and fails
+    #   the module's elements=dict coercion.
+    #
+    #   The CLI cannot be driven through the kolla_toolbox module either: it
+    #   renders module_args as key='value', and ansible's -a for command/shell
+    #   is FREE-FORM, so `cmd=openstack ...` becomes a command literally named
+    #   "cmd=openstack".
+    #
+    # argv rather than a string, so nothing depends on quoting: the description
+    # has spaces and the secret is arbitrary. The container name is kolla's own
+    # constant — the kolla_toolbox module execs into exactly this container.
+    # Keystone application credentials are immutable and create is not
+    # idempotent, so a leftover of the same name fails the deploy with a
+    # conflict. That is reachable by the rotate procedure this file documents —
+    # delete the recorded id and re-run — and by any run whose create succeeded
+    # and whose record step did not.
+    #
+    # Deleting first is safe precisely because the secret is SUPPLIED rather
+    # than generated: the credential that replaces it is identical, so nothing
+    # already deployed is invalidated. failed_when false because "not found" is
+    # the normal case, not an error.
+    - name: Removing any leftover application credential of the same name
+      become: true
+      ansible.builtin.command:
+        argv: >-
+          {{ [kolla_container_engine, 'exec', 'kolla_toolbox',
+              'openstack', 'application', 'credential', 'delete',
+              ferry_keystone_application_credential_name,
+              '--os-auth-url', keystone_internal_url,
+              '--os-username', ferry_keystone_user,
+              '--os-password', ferry_keystone_password,
+              '--os-project-name', 'service',
+              '--os-user-domain-name', default_user_domain_name,
+              '--os-project-domain-name', default_project_domain_name,
+              '--os-identity-api-version', '3',
+              '--os-interface', openstack_interface] }}
+      delegate_to: "{{ groups['ferry-manager'][0] }}"
+      register: ferry_appcred_removed
+      failed_when: false
+      changed_when: ferry_appcred_removed.rc == 0
+      no_log: true
+
+    - name: Creating the application credential in Keystone
+      become: true
+      ansible.builtin.command:
+        argv: >-
+          {{ [kolla_container_engine, 'exec', 'kolla_toolbox',
+              'openstack', 'application', 'credential', 'create',
+              ferry_keystone_application_credential_name,
+              '--secret', ferry_keystone_password_appcred,
+              '--description', 'ferry-manager service identity for ' ~ ferry_cloud_name,
+              '-f', 'json',
+              '--os-auth-url', keystone_internal_url,
+              '--os-username', ferry_keystone_user,
+              '--os-password', ferry_keystone_password,
+              '--os-project-name', 'service',
+              '--os-user-domain-name', default_user_domain_name,
+              '--os-project-domain-name', default_project_domain_name,
+              '--os-identity-api-version', '3',
+              '--os-interface', openstack_interface]
+             + (['--role'] | product(ferry_appcred_roles | map(attribute='name')) | map('list') | flatten) }}
+      register: ferry_appcred_created
+      delegate_to: "{{ groups['ferry-manager'][0] }}"
+      changed_when: true
+      no_log: true
+
+    - name: Recording the application credential id on the deploy host
+      delegate_to: localhost
+      vars:
+        ansible_become: false
+      become: false
+      ansible.builtin.copy:
+        content: |
+          # Written by the ferry role. The id of Ferry's Keystone application
+          # credential; the secret is ferry_keystone_application_credential_secret
+          # in passwords.yml. Delete this file and re-run to rotate.
+          ferry_keystone_application_credential_id: "{{ (ferry_appcred_created.stdout | from_json).id }}"
+        dest: "{{ ferry_appcred_file }}"
+        mode: "0600"
+
+# Read on the controller, so every manager host gets it and not just the one
+# the block above ran on.
+- name: Loading Ferry's application credential id
+  ansible.builtin.include_vars:
+    file: "{{ ferry_appcred_file }}"
+  when: ferry_keystone_application_credential_id | length == 0

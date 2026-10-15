@@ -1,0 +1,63 @@
+database:
+  bootstrap:
+    enabled: true
+  embedded:
+    enabled: true
+    storage: 20Gi
+
+keystone:
+  authUrl: http://keystone-internal.openstack.svc:5000/v3
+  region: regionOne
+  userDomain: Default
+  projectDomain: Default
+  bootstrap:
+    enabled: false
+  catalog:
+    register: true
+    serviceName: ferry
+    serviceType: backup
+
+ceph:
+  enabled: true
+  conf:
+    secret: ceph-conf-files
+    key: ceph.conf
+  keyrings:
+    existingSecret: ceph-conf-files
+  users:
+    manager: openstack
+    mover: openstack
+    restore: openstack
+  pools:
+    volumes: [volumes]
+    vms: [vms]
+    images: [images]
+
+compute:
+  enabled: true
+  daemonset: false
+  localDiskBackup: true
+  edpm:
+    enabled: true
+    libvirtSocket: /run/libvirt/virtqemud-sock
+    qemu:
+      uid: 107
+      gid: 107
+
+api:
+  route:
+    enabled: true
+
+extraObjects:
+  - apiVersion: keystone.openstack.org/v1beta1
+    kind: KeystoneService
+    metadata:
+      name: "{{ .Values.keystone.catalog.serviceName }}"
+    spec:
+      enabled: true
+      serviceName: "{{ .Values.keystone.catalog.serviceName }}"
+      serviceType: "{{ .Values.keystone.catalog.serviceType }}"
+      serviceDescription: Ferry backup, recovery and DRaaS
+      serviceUser: "{{ .Values.keystone.user }}"
+      secret: "{{ include \"ferry.credentialsSecret\" . }}"
+      passwordSelector: keystone-password

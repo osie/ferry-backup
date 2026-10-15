@@ -1,0 +1,113 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "ferry.apiService" . }}
+  labels:
+    {{- include "ferry.componentLabels" (dict "root" . "component" "manager") | nindent 4 }}
+  {{- with .Values.api.service.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ .Values.api.service.type }}
+  selector:
+    {{- include "ferry.selector" (dict "root" . "component" "manager") | nindent 4 }}
+  ports:
+    - name: api
+      port: {{ .Values.api.service.port }}
+      targetPort: api
+      {{- if and (eq .Values.api.service.type "NodePort") .Values.api.service.nodePort }}
+      nodePort: {{ .Values.api.service.nodePort }}
+      {{- end }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "ferry.moverApiService" . }}
+  labels:
+    {{- include "ferry.componentLabels" (dict "root" . "component" "manager") | nindent 4 }}
+  {{- with .Values.moverApi.service.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ .Values.moverApi.service.type }}
+  selector:
+    {{- include "ferry.selector" (dict "root" . "component" "manager") | nindent 4 }}
+  ports:
+    - name: mover-api
+      port: {{ .Values.moverApi.service.port }}
+      targetPort: mover-api
+{{- if or .Values.mover.awaitManagers (and .Values.compute.enabled .Values.compute.daemonset .Values.compute.awaitManagers) }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "ferry.managerReplicasService" . }}
+  labels:
+    {{- include "ferry.componentLabels" (dict "root" . "component" "manager") | nindent 4 }}
+spec:
+  clusterIP: None
+  selector:
+    {{- include "ferry.selector" (dict "root" . "component" "manager") | nindent 4 }}
+  ports:
+    - name: api
+      port: 9776
+      targetPort: api
+    - name: mover-api
+      port: 9777
+      targetPort: mover-api
+{{- end }}
+{{- if .Values.api.ingress.enabled }}
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ include "ferry.apiService" . }}
+  labels:
+    {{- include "ferry.componentLabels" (dict "root" . "component" "manager") | nindent 4 }}
+  {{- with .Values.api.ingress.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  {{- with .Values.api.ingress.className }}
+  ingressClassName: {{ . }}
+  {{- end }}
+  {{- with .Values.api.ingress.tls }}
+  tls:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  rules:
+    - host: {{ required "api.ingress.host is required when the ingress is enabled" .Values.api.ingress.host | quote }}
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ include "ferry.apiService" . }}
+                port:
+                  name: api
+{{- end }}
+{{- if .Values.api.route.enabled }}
+---
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  name: {{ include "ferry.apiService" . }}
+  labels:
+    {{- include "ferry.componentLabels" (dict "root" . "component" "manager") | nindent 4 }}
+spec:
+  {{- with .Values.api.route.host }}
+  host: {{ . | quote }}
+  {{- end }}
+  to:
+    kind: Service
+    name: {{ include "ferry.apiService" . }}
+  port:
+    targetPort: api
+  tls:
+    termination: {{ .Values.api.route.tls.termination }}
+    insecureEdgeTerminationPolicy: Redirect
+{{- end }}

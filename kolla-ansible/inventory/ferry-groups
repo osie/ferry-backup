@@ -1,0 +1,45 @@
+# Ferry's inventory groups.
+#
+# Pass this as a second inventory rather than editing your own:
+#
+#   kolla-ansible deploy -i /etc/kolla/inventory -i /etc/kolla/ferry-groups \
+#     -p .../ansible/ferry.yml
+#
+# The three groups are three different jobs and three different privilege
+# levels, which is why they are separable even when they land on the same host:
+#
+#   ferry-manager   the control plane. Holds the database credential, the
+#                   Keystone credential and — briefly, per job — every
+#                   unwrapped DEK. Put it where the other control services are.
+#
+#   ferry-mover     the data plane. Reads production RBD images and writes to
+#                   the chunk repository, so it wants bandwidth and proximity
+#                   to Ceph, and it wants its own blast radius: a mover OOMing
+#                   on a large volume must not take the API down with it.
+#
+#   ferry-compute   the quiesce agent. Must be on every hypervisor whose guests
+#                   should get filesystem-consistent backups, because it talks
+#                   to that node's libvirt socket and nothing else. Leaving a
+#                   hypervisor out is supported: its guests get crash-consistent
+#                   backups, reported as such.
+
+[ferry-manager:children]
+control
+
+[ferry-mover:children]
+control
+
+[ferry-compute:children]
+compute
+
+# Movers that are in the storage fabric: zoned into it, with an initiator the
+# array knows, so Cinder can mask a volume to them.
+#
+# EMPTY BY DEFAULT, and on a Ceph-only cloud it stays empty — nothing here is
+# needed to read an RBD image or a running guest's disk.
+#
+# Fill it in if any Cinder backend is not Ceph. Restoring onto such a volume
+# means attaching it, and only a host in this group can. Two or three is
+# plenty; they do not have to be movers that do anything else, and they are
+# the only Ferry hosts that run privileged.
+[ferry-mover-fabric]

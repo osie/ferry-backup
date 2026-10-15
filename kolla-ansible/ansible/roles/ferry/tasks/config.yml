@@ -1,0 +1,321 @@
+---
+- name: Ensuring config directories exist
+  ansible.builtin.file:
+    path: "{{ node_config_directory }}/{{ item.key }}"
+    state: "directory"
+    owner: "{{ config_owner_user }}"
+    group: "{{ config_owner_group }}"
+    mode: "0770"
+  become: true
+  with_dict: "{{ ferry_services | select_services_enabled_and_mapped_to_host }}"
+
+- name: Ensuring PKI directories exist
+  ansible.builtin.file:
+    path: "{{ node_config_directory }}/{{ item.key }}/pki"
+    state: "directory"
+    owner: "{{ config_owner_user }}"
+    group: "{{ config_owner_group }}"
+    mode: "0770"
+  become: true
+  with_dict: "{{ ferry_services | select_services_enabled_and_mapped_to_host }}"
+
+- name: Copying over TLS certificates
+  ansible.builtin.include_tasks: copy-certs.yml
+  when: ferry_copy_certs | bool
+
+# Ferry's own CA. Every container verifies its peers against exactly this, and
+# nothing else: kolla's internal certificate is a server certificate for the
+# VIP, not a CA that issues client identities.
+- name: Copying over Ferry's CA certificate
+  ansible.builtin.copy:
+    src: "{{ ferry_pki_dir }}/ca.crt"
+    dest: "{{ node_config_directory }}/{{ item.key }}/pki/ca.crt"
+    owner: "{{ config_owner_user }}"
+    group: "{{ config_owner_group }}"
+    mode: "0640"
+  become: true
+  with_dict: "{{ ferry_services | select_services_enabled_and_mapped_to_host }}"
+  # All three, because this task loops over whichever services are here. The
+  # handlers are guarded by the same mapping check, so a handler for a service
+  # this host does not run is a no-op rather than a container appearing where
+  # it should not.
+  notify:
+    - Restart ferry-manager container
+    - Restart ferry-mover container
+    - Restart ferry-compute container
+
+# The manager serves the pull protocol and dials ferry-compute, so it carries a
+# server certificate for 9777 and a client certificate for 9779.
+- name: Copying over the manager's certificates
+  vars:
+    service: "{{ ferry_services['ferry-manager'] }}"
+  ansible.builtin.copy:
+    src: "{{ ferry_pki_dir }}/{{ item }}"
+    dest: "{{ node_config_directory }}/ferry-manager/pki/{{ item }}"
+    owner: "{{ config_owner_user }}"
+    group: "{{ config_owner_group }}"
+    mode: "{{ '0600' if item.endswith('.key') else '0640' }}"
+  become: true
+  loop:
+    - mover-api-server.crt
+    - mover-api-server.key
+    - manager-client.crt
+    - manager-client.key
+  when: service | service_enabled_and_mapped_to_host
+  notify:
+    - Restart ferry-manager container
+
+# One certificate per mover, and its CN is this mover's mover_id. The manager
+# refuses a claim whose mover_id is not the CN of the certificate that carried
+# it, so a mover cannot claim another mover's jobs and be handed its keys.
+- name: Copying over this mover's certificate
+  vars:
+    service: "{{ ferry_services['ferry-mover'] }}"
+  ansible.builtin.copy:
+    src: "{{ ferry_pki_dir }}/mover-{{ inventory_hostname }}.{{ item.ext }}"
+    dest: "{{ node_config_directory }}/ferry-mover/pki/mover.{{ item.ext }}"
+    owner: "{{ config_owner_user }}"
+    group: "{{ config_owner_group }}"
+    mode: "{{ item.mode }}"
+  become: true
+  loop:
+    - {ext: "crt", mode: "0640"}
+    - {ext: "key", mode: "0600"}
+  loop_control:
+    label: "mover.{{ item.ext }}"
+  when: service | service_enabled_and_mapped_to_host
+  notify:
+    - Restart ferry-mover container
+
+- name: Copying over this compute agent's certificate
+  vars:
+    service: "{{ ferry_services['ferry-compute'] }}"
+  ansible.builtin.copy:
+    src: "{{ ferry_pki_dir }}/compute-{{ inventory_hostname }}.{{ item.ext }}"
+    dest: "{{ node_config_directory }}/ferry-compute/pki/compute-server.{{ item.ext }}"
+    owner: "{{ config_owner_user }}"
+    group: "{{ config_owner_group }}"
+    mode: "{{ item.mode }}"
+  become: true
+  loop:
+    - {ext: "crt", mode: "0640"}
+    - {ext: "key", mode: "0600"}
+  loop_control:
+    label: "compute-server.{{ item.ext }}"
+  when: service | service_enabled_and_mapped_to_host
+  notify:
+    - Restart ferry-compute container
+
+# Ceph. Two directories rather than one, and that is a deliberate split rather than tidiness:
+# the manager's key is the wide one and the mover side must not carry it. What
+# the mover side does carry is its own read-only key and the restore key,
+# which is the only one in that directory able to write a production pool and
+# is used only by a restore work order.
+- name: Ensuring the Ceph directories exist
+  ansible.builtin.file:
+    path: "{{ node_config_directory }}/{{ item }}/ceph"
+    state: "directory"
+    owner: "{{ config_owner_user }}"
+    group: "{{ config_owner_group }}"
+    mode: "0770"
+  become: true
+  loop:
+    - ferry-manager
+    - ferry-mover
+  when:
+    - ferry_ceph_enabled | bool
+    - ferry_services[item] | service_enabled_and_mapped_to_host
+
+- name: Copying over ceph.conf
+  ansible.builtin.copy:
+    src: "{{ ferry_ceph_config_dir }}/ceph.conf"
+    dest: "{{ node_config_directory }}/{{ item }}/ceph/ceph.conf"
+    owner: "{{ config_owner_user }}"
+    group: "{{ config_owner_group }}"
+    mode: "0640"
+  become: true
+  loop:
+    - ferry-manager
+    - ferry-mover
+  when:
+    - ferry_ceph_enabled | bool
+    - ferry_services[item] | service_enabled_and_mapped_to_host
+  notify:
+    - Restart ferry-manager container
+    - Restart ferry-mover container
+
+# The manager gets its own key and the RESTORE key, and no other.
+#
+# Its own is for what only it does: snapshot production, rotate anchors, poll
+# `rbd trash ls`. The restore key is for the one manager-side operation
+# that writes a tenant's volume — promoting a standby, which is a
+# clone out of Ferry's standby pool and a Cinder manage into the pool Cinder
+# serves. The deliberate privilege split gives that its own identity precisely because the manager's must
+# not be able to do it, and the standby pool is granted to the restore key and
+# not to the manager's, so dialling as the manager gets
+# "denied by cephx: rbd: ret=-1, Operation not permitted" naming an image that
+# is right there.
+#
+# The mover's key is NOT here: the manager never reads a volume.
+- name: Copying over the manager's cephx keyrings
+  vars:
+    service: "{{ ferry_services['ferry-manager'] }}"
+  ansible.builtin.copy:
+    src: "{{ ferry_ceph_config_dir }}/ceph.client.{{ item }}.keyring"
+    dest: "{{ node_config_directory }}/ferry-manager/ceph/ceph.client.{{ item }}.keyring"
+    owner: "{{ config_owner_user }}"
+    group: "{{ config_owner_group }}"
+    mode: "0600"
+  become: true
+  loop:
+    - "{{ ferry_ceph_manager_user }}"
+    - "{{ ferry_ceph_restore_user }}"
+  when:
+    - ferry_ceph_enabled | bool
+    - service | service_enabled_and_mapped_to_host
+  notify:
+    - Restart ferry-manager container
+
+- name: Copying over the mover's cephx keyrings
+  vars:
+    service: "{{ ferry_services['ferry-mover'] }}"
+  ansible.builtin.copy:
+    src: "{{ ferry_ceph_config_dir }}/ceph.client.{{ item }}.keyring"
+    dest: "{{ node_config_directory }}/ferry-mover/ceph/ceph.client.{{ item }}.keyring"
+    owner: "{{ config_owner_user }}"
+    group: "{{ config_owner_group }}"
+    mode: "0600"
+  become: true
+  loop:
+    - "{{ ferry_ceph_mover_user }}"
+    - "{{ ferry_ceph_restore_user }}"
+  when:
+    - ferry_ceph_enabled | bool
+    - service | service_enabled_and_mapped_to_host
+  notify:
+    - Restart ferry-mover container
+
+# The manager's key is deliberately NOT in the mover's directory. Deployments
+# that predate ceph.mover.user had to put it there, because the work order
+# carried the manager's identity; a file this role no longer writes is a file
+# that stays until something removes it.
+- name: Removing the manager's keyring from the mover
+  ansible.builtin.file:
+    path: "{{ node_config_directory }}/ferry-mover/ceph/ceph.client.{{ ferry_ceph_manager_user }}.keyring"
+    state: absent
+  become: true
+  when: ferry_services['ferry-mover'] | service_enabled_and_mapped_to_host
+
+- name: Ensuring the console branding directory exists
+  vars:
+    service: "{{ ferry_services['ferry-manager'] }}"
+  ansible.builtin.file:
+    path: "{{ node_config_directory }}/ferry-manager/console"
+    state: "directory"
+    owner: "{{ config_owner_user }}"
+    group: "{{ config_owner_group }}"
+    mode: "0770"
+  become: true
+  when:
+    - ferry_console_files | length > 0
+    - service | service_enabled_and_mapped_to_host
+
+- name: Copying over the console branding
+  vars:
+    service: "{{ ferry_services['ferry-manager'] }}"
+  ansible.builtin.copy:
+    src: "{{ ferry_console_dir }}/{{ item }}"
+    dest: "{{ node_config_directory }}/ferry-manager/console/{{ item | basename }}"
+    owner: "{{ config_owner_user }}"
+    group: "{{ config_owner_group }}"
+    mode: "0640"
+  become: true
+  loop: "{{ ferry_console_files }}"
+  when: service | service_enabled_and_mapped_to_host
+  notify:
+    - Restart ferry-manager container
+
+# The configuration itself. merge_yaml rather than template, because these are
+# YAML and an operator overriding one key should not have to restate the file.
+# Configuration decoding rejects unknown keys, so a typo in an override is a
+# component that will not start rather than a setting that quietly did nothing.
+- name: Copying over manager.yaml
+  vars:
+    service: "{{ ferry_services['ferry-manager'] }}"
+  merge_yaml:
+    sources:
+      - "{{ role_path }}/templates/manager.yaml.j2"
+      - "{{ node_custom_config }}/ferry/manager.yaml"
+      - "{{ node_custom_config }}/ferry/{{ inventory_hostname }}/manager.yaml"
+    dest: "{{ node_config_directory }}/ferry-manager/manager.yaml"
+    mode: "0600"
+  become: true
+  when: service | service_enabled_and_mapped_to_host
+  notify:
+    - Restart ferry-manager container
+
+- name: Copying over mover.yaml
+  vars:
+    service: "{{ ferry_services['ferry-mover'] }}"
+  merge_yaml:
+    sources:
+      - "{{ role_path }}/templates/mover.yaml.j2"
+      - "{{ node_custom_config }}/ferry/mover.yaml"
+      - "{{ node_custom_config }}/ferry/{{ inventory_hostname }}/mover.yaml"
+    dest: "{{ node_config_directory }}/ferry-mover/mover.yaml"
+    mode: "0640"
+  become: true
+  when: service | service_enabled_and_mapped_to_host
+  notify:
+    - Restart ferry-mover container
+
+- name: Copying over compute.yaml
+  vars:
+    service: "{{ ferry_services['ferry-compute'] }}"
+  merge_yaml:
+    sources:
+      - "{{ role_path }}/templates/compute.yaml.j2"
+      - "{{ node_custom_config }}/ferry/compute.yaml"
+      - "{{ node_custom_config }}/ferry/{{ inventory_hostname }}/compute.yaml"
+    dest: "{{ node_config_directory }}/ferry-compute/compute.yaml"
+    mode: "0640"
+  become: true
+  when: service | service_enabled_and_mapped_to_host
+  notify:
+    - Restart ferry-compute container
+
+# ferry-compute records in-flight freezes on a host path, so its own crash is
+# not a way to leave a guest frozen: a restarted agent reads this and thaws
+# before it serves.
+- name: Ensuring the compute agent's state directory exists
+  vars:
+    service: "{{ ferry_services['ferry-compute'] }}"
+  ansible.builtin.file:
+    path: /var/lib/ferry/compute
+    state: directory
+    owner: root
+    group: root
+    mode: "0750"
+  become: true
+  when: service | service_enabled_and_mapped_to_host
+
+- name: Ensuring kolla's Prometheus config override directory exists
+  ansible.builtin.file:
+    path: "{{ node_custom_config }}/prometheus/prometheus.yml.d"
+    state: directory
+    mode: "0755"
+  delegate_to: localhost
+  run_once: true
+  when: ferry_prometheus_integration | bool
+
+- name: Copying over Ferry's Prometheus scrape config and alert rules
+  ansible.builtin.copy:
+    src: "prometheus/{{ item.src }}"
+    dest: "{{ node_custom_config }}/prometheus/{{ item.dest }}"
+    mode: "0644"
+  delegate_to: localhost
+  run_once: true
+  loop:
+    - { src: 50-ferry.yml, dest: prometheus.yml.d/50-ferry.yml }
+    - { src: ferry.rules, dest: ferry.rules }
+  when: ferry_prometheus_integration | bool

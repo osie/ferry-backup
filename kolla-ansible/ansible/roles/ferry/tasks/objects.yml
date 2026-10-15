@@ -1,0 +1,66 @@
+---
+# The RGW gateway credential for bucket protection.
+#
+# Read rather than minted, and that is not a preference. Creating an RGW user
+# needs `radosgw-admin`, which needs a Ceph admin keyring; a kolla control host
+# has neither on any cloud whose Ceph is deployed separately — and on the clouds
+# Ferry runs on, the RGW hosts are not in kolla's inventory at all, so there is
+# nothing to delegate the task to. kolla-ansible/tools/create-rgw-user.sh does it
+# on a host that can, exactly as create-cephx.sh already does for the three
+# cephx identities, and this reads back what it wrote.
+#
+# Every task here runs on the DEPLOY HOST with ansible_become false, for the
+# reason appcred.yml sets out at length: kolla's multinode inventory carries
+# ansible_become=true in [all:vars], that connection variable beats a task's
+# become for delegate_to: localhost, and include_vars then reads the file on the
+# controller as the user running kolla-ansible — which cannot read it back if it
+# landed root-owned.
+
+- name: Checking for a recorded RGW gateway credential
+  run_once: true
+  delegate_to: localhost
+  vars:
+    ansible_become: false
+  become: false
+  ansible.builtin.stat:
+    path: "{{ ferry_objects_file }}"
+  register: ferry_objects_stat
+
+# Fails the deploy rather than rendering a manager with no gateway credential.
+# A manager configured with an endpoint and no keys answers every bucket
+# operation with a 403 from RGW, which reads like a permissions problem on the
+# cloud rather than a step that was never run.
+- name: Refusing to configure bucket protection with no gateway credential
+  run_once: true
+  when:
+    - ferry_objects_enabled | bool
+    - not ferry_objects_stat.stat.exists
+    - ferry_objects_access_key | length == 0
+  ansible.builtin.fail:
+    msg: |
+      ferry_objects_enabled is on and there is no RGW gateway credential.
+
+      Run this once on a host with a Ceph admin keyring — a mon, or wherever
+      you ran create-cephx.sh:
+
+          kolla-ansible/tools/create-rgw-user.sh
+
+      It mints the `{{ ferry_objects_user | default('ferry-gateway') }}` RGW
+      system user (idempotent — an existing user's keys are read back, not
+      rotated) and writes them to {{ ferry_objects_file }} on this host.
+
+      Copy that file to the deploy host if you ran the tool elsewhere, or set
+      ferry_objects_access_key and ferry_objects_secret_key yourself.
+
+- name: Loading the RGW gateway credential
+  run_once: true
+  delegate_to: localhost
+  vars:
+    ansible_become: false
+  become: false
+  when:
+    - ferry_objects_enabled | bool
+    - ferry_objects_stat.stat.exists
+    - ferry_objects_access_key | length == 0
+  ansible.builtin.include_vars:
+    file: "{{ ferry_objects_file }}"

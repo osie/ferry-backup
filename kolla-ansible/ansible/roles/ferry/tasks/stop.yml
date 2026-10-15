@@ -1,0 +1,20 @@
+---
+- name: Stop the ferry-mover container within its drain
+  vars:
+    service: "{{ ferry_services['ferry-mover'] }}"
+  become: true
+  kolla_container:
+    action: "stop_container"
+    common_options: "{{ docker_common_options }}"
+    name: "{{ service.container_name }}"
+    graceful_timeout: "{{ service.graceful_timeout }}"
+    client_timeout: "{{ service.client_timeout }}"
+    ignore_missing: true
+  when: service | service_enabled_and_mapped_to_host
+
+- name: Stop ferry containers
+  ansible.builtin.import_role:
+    name: service-stop
+  vars:
+    project_services: "{{ ferry_services }}"
+    service_name: "{{ project_name }}"

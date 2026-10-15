@@ -1,0 +1,40 @@
+---
+# The manager owns its own MariaDB schema and applies its own migrations at
+# startup, with a checksum guard that refuses a mismatched binary/schema pair
+# loudly. So there is no bootstrap container here — only the database and
+# the user it connects as.
+- name: Creating the ferry database
+  become: true
+  kolla_toolbox:
+    container_engine: "{{ kolla_container_engine }}"
+    module_name: mysql_db
+    module_args:
+      ca_cert: "{{ openstack_cacert if database_enable_tls_internal | bool else omit }}"
+      login_host: "{{ database_address }}"
+      login_port: "{{ database_port }}"
+      login_user: "{{ ferry_database_shard_root_user }}"
+      login_password: "{{ database_password }}"
+      name: "{{ ferry_database_name }}"
+  run_once: true
+  delegate_to: "{{ groups['ferry-manager'][0] }}"
+  when: not use_preconfigured_databases | bool
+
+- name: Creating the ferry database user and setting permissions
+  become: true
+  kolla_toolbox:
+    container_engine: "{{ kolla_container_engine }}"
+    module_name: mysql_user
+    module_args:
+      ca_cert: "{{ openstack_cacert if database_enable_tls_internal | bool else omit }}"
+      login_host: "{{ database_address }}"
+      login_port: "{{ database_port }}"
+      login_user: "{{ ferry_database_shard_root_user }}"
+      login_password: "{{ database_password }}"
+      name: "{{ ferry_database_user }}"
+      password: "{{ ferry_database_password }}"
+      host: "%"
+      priv: "{{ ferry_database_name }}.*:ALL"
+      append_privs: "yes"
+  run_once: true
+  delegate_to: "{{ groups['ferry-manager'][0] }}"
+  when: not use_preconfigured_databases | bool

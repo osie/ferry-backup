@@ -1,0 +1,36 @@
+---
+# Deliberately NOT service-check-containers.
+#
+# That role's compare_container execs /usr/local/bin/kolla_set_configs --check
+# inside the container to decide whether the config is stale. Ferry's images
+# are not kolla images — they are a binary on plain Ubuntu or Debian, with no
+# kolla_start and no set_configs — so that exec fails and the task errors out
+# rather than reporting a difference.
+#
+# start_container gets the same result without it: it pulls when the image is
+# missing, recreates when the container's parameters differ, and starts what is
+# not running. Config changes are handled where they are actually detected —
+# config.yml notifies the restart handlers when a rendered file changes.
+- name: Starting ferry containers
+  vars:
+    service: "{{ item.value }}"
+  become: true
+  kolla_container:
+    action: "start_container"
+    common_options: "{{ docker_common_options }}"
+    name: "{{ service.container_name }}"
+    image: "{{ service.image }}"
+    volumes: "{{ service.volumes | reject('equalto', '') | list }}"
+    dimensions: "{{ service.dimensions }}"
+    # Only the fabric mover sets this, and only because attaching a LUN means
+    # driving the SCSI stack. Every other ferry container runs unprivileged, and
+    # `| default(false)` is what keeps it that way.
+    privileged: "{{ service.privileged | default(false) | bool }}"
+    # Same rule as privileged: recreation rebuilds from exactly what is passed,
+    # so anything omitted here is silently dropped from the container.
+    environment: "{{ service.environment | default({}) }}"
+    graceful_timeout: "{{ service.graceful_timeout | default(omit) }}"
+    client_timeout: "{{ service.client_timeout | default(omit) }}"
+  with_dict: "{{ ferry_services | select_services_enabled_and_mapped_to_host }}"
+  loop_control:
+    label: "{{ item.key }}"

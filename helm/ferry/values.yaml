@@ -1,0 +1,278 @@
+images:
+  manager: ghcr.io/osie/ferry-manager:0.17.0
+  mover: ghcr.io/osie/ferry-mover:0.17.0
+  compute: ghcr.io/osie/ferry-compute:0.17.0
+  cephHelper: docker.io/openstackhelm/ceph-config-helper:ubuntu_jammy_19.2.2-1-20250414
+  mariadb: docker.io/library/mariadb:11.4
+  pullPolicy: IfNotPresent
+imagePullSecrets: []
+
+cloud:
+  name: ""
+  site: ""
+  region: RegionOne
+  timezone: ""
+
+logLevel: info
+
+credentials:
+  existingSecret: ""
+
+database:
+  host: mariadb.openstack.svc.cluster.local
+  port: 3306
+  name: ferry
+  user: ferry
+  params: "tls=false"
+  bootstrap:
+    enabled: true
+    admin:
+      user: root
+      secretName: mariadb-dbadmin-password
+      secretKey: MYSQL_DBADMIN_PASSWORD
+  embedded:
+    enabled: false
+    storage: 20Gi
+    storageClass: ""
+    resources: {}
+
+keystone:
+  authUrl: http://keystone-api.openstack.svc.cluster.local:5000/v3
+  region: RegionOne
+  interface: internal
+  user: ferry
+  userDomain: Default
+  project: service
+  projectDomain: Default
+  roles: [admin, reader]
+  applicationCredentialName: ferry-manager
+  applicationCredentialId: ""
+  caSecret: ""
+  caKey: ca.crt
+  restoreTrustTTL: 24h
+  bootstrap:
+    enabled: true
+    adminSecret: keystone-keystone-admin
+  catalog:
+    register: true
+    serviceName: ferry
+    serviceType: backup
+    publicUrl: ""
+    internalUrl: ""
+
+kms:
+  driver: none
+  barbican:
+    secretId: ""
+  vault:
+    address: ""
+    mount: transit
+    keyName: ferry
+    tokenSecret: ""
+    tokenKey: token
+
+ceph:
+  enabled: true
+  conf:
+    configMap: ceph-etc
+    secret: ""
+    key: ceph.conf
+  keyrings:
+    existingSecret: ""
+    bootstrap:
+      enabled: false
+      adminSecret: pvc-ceph-client-key
+      adminKey: key
+      adminUser: admin
+  users:
+    manager: ferry-manager
+    mover: ferry-mover
+    restore: ferry-restore
+  pools:
+    volumes: [volumes]
+    vms: [vms]
+    images: [images]
+    ferry: []
+  mirror:
+    driveSchedule: false
+    enableImages: false
+  volumeNameTemplate: "volume-%s"
+  removeNovaOrphans: false
+
+limits:
+  maxConcurrentReadsPerPool: 4
+  osdClientOpPriority: 1
+  readParallelism: 4
+  uploadParallelism: 4
+  maxInflightJobs: 16
+  pauseWhenDegraded: true
+
+gc:
+  gracePeriod: 48h
+  moverGracePeriod: 72h
+
+dr:
+  enabled: false
+  runDeadline: 12h
+  probe:
+    image: ""
+    flavor: ""
+    direct: false
+
+console:
+  productName: ""
+  primaryColor: ""
+  primaryColorDark: ""
+  filesConfigMap: ""
+  logo: ""
+  logoDark: ""
+  logoOnly: false
+  logoAlign: ""
+  logoHeight: 0
+  logoWidth: 0
+  favicon: ""
+  stylesheet: ""
+
+manager:
+  replicas: 2
+  resources:
+    requests: {cpu: 100m, memory: 256Mi}
+    limits: {memory: 1Gi}
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+  podAnnotations: {}
+  extraEnv: []
+  extraVolumes: []
+  extraVolumeMounts: []
+  extraConfig: {}
+
+mover:
+  replicas: 2
+  awaitManagers: true
+  maxParallel: 2
+  parallelism:
+    image: 2
+    segment: 2
+    read: 2
+    upload: 2
+  repoOpenTimeout: 30s
+  drainTimeoutSeconds: 90
+  scratch:
+    sizeLimit: 20Gi
+  resources:
+    requests: {cpu: 250m, memory: 512Mi}
+    limits: {memory: 4Gi}
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+  podAnnotations: {}
+  networks: ""
+  extraEnv: []
+  extraVolumes: []
+  extraVolumeMounts: []
+  extraConfig: {}
+
+compute:
+  enabled: true
+  daemonset: true
+  awaitManagers: true
+  tlsServerName: ""
+  port: 9779
+  adminPort: 9780
+  nodeSelector:
+    openstack-compute-node: enabled
+  tolerations:
+    - operator: Exists
+  libvirt:
+    runDir: /run/libvirt
+    socket: libvirt-sock
+    uri: "qemu:///system"
+    libDir: /var/lib/libvirt
+  novaInstancesDir: /var/lib/nova/instances
+  stateDir: /var/lib/ferry/compute
+  maxFreeze: 30s
+  requireQuiesce: false
+  localDiskBackup: false
+  qemu:
+    uid: 42424
+    gid: 42424
+  scratchDir: /var/lib/libvirt/ferry/scratch
+  socketDir: /var/lib/libvirt/ferry/sockets
+  maxScratchBytes: 0
+  backup:
+    maxDuration: 24h
+    defaultTTL: 1h
+    maxConcurrent: 2
+  resources:
+    requests: {cpu: 50m, memory: 64Mi}
+    limits: {memory: 256Mi}
+  extraEnv: []
+  extraConfig: {}
+  hosts: {}
+  edpm:
+    enabled: false
+    serviceName: ferry-compute
+    nodeSets: []
+    deploy: false
+    libvirtSocket: /run/libvirt/virtqemud-sock
+    qemu:
+      uid: 107
+      gid: 107
+
+pki:
+  provider: cert-manager
+  certManager:
+    issuerRef: {}
+    issuerLabels: {}
+    duration: 8760h
+    renewBefore: 720h
+  existing:
+    ca: ""
+    moverApiServer: ""
+    managerClient: ""
+    computeServer: ""
+    movers: []
+
+api:
+  service:
+    type: ClusterIP
+    port: 9776
+    nodePort: null
+    annotations: {}
+  ingress:
+    enabled: false
+    className: ""
+    host: ""
+    annotations: {}
+    tls: []
+  route:
+    enabled: false
+    host: ""
+    tls:
+      termination: edge
+
+moverApi:
+  service:
+    type: ClusterIP
+    port: 9777
+    annotations: {}
+
+metrics:
+  enabled: false
+  serviceMonitor:
+    enabled: false
+    labels: {}
+  prometheusRule:
+    enabled: false
+    labels: {}
+
+serviceAccount:
+  create: true
+  name: ""
+  annotations: {}
+
+podSecurityContext: {}
+securityContext: {}
+
+extraObjects: []

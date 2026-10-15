@@ -1,0 +1,58 @@
+name: ferry-compute
+type: charm
+title: Ferry compute agent
+summary: Ferry's agent on a hypervisor, for fsfreeze and the local-disk read path.
+description: |
+  A subordinate for the hypervisor charm — nova-compute on Charmed OpenStack,
+  openstack-hypervisor on Canonical OpenStack. It freezes guests through
+  libvirt's qemu-agent channel and, where the ferry application enables it,
+  serves disks Ferry cannot read from the cluster.
+links:
+  source: https://github.com/osie/ferry-deploy
+base: ubuntu@24.04
+platforms:
+  amd64:
+parts:
+  charm:
+    plugin: charm
+    source: .
+    charm-binary-python-packages:
+      - ops
+      - PyYAML
+      - websocket-client
+subordinate: true
+assumes:
+  - juju >= 3.1
+
+requires:
+  juju-info:
+    interface: juju-info
+    scope: container
+  manager:
+    interface: ferry-compute
+    limit: 1
+
+provides:
+  metrics-endpoint:
+    interface: prometheus_scrape
+
+resources:
+  compute-image:
+    type: file
+    filename: compute.tar
+    description: A docker-archive of the ferry-compute image, for hosts that cannot reach the registry.
+
+config:
+  options:
+    libvirt-socket:
+      type: string
+      default: ""
+      description: libvirt's socket. Found automatically for nova-compute and the openstack-hypervisor snap.
+    scratch-dir:
+      type: string
+      default: ""
+      description: Where QEMU keeps a backup's copy-on-write scratch. Must be a path QEMU can open.
+    qemu-user:
+      type: string
+      default: ""
+      description: The user QEMU runs as, which must own the scratch. Found automatically.

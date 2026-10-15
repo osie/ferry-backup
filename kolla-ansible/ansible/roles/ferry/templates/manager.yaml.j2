@@ -1,0 +1,383 @@
+# ferry-manager, rendered by kolla-ansible. Do not edit on the node.
+#
+# Override anything here from {{ node_custom_config }}/ferry/manager.yaml, which
+# is merged over this file. Configuration decoding rejects unknown keys, so a
+# typo in that file is a manager that will not start rather than a setting that
+# quietly did nothing.
+
+# One per cloud. `central` is the operator-facing multi-cloud manager;
+# it is deliberately in no cloud's catalog and is not what this role deploys.
+mode: local
+
+# The claim owner. No scheduling meaning — any replica may own any job — but it
+# has to be unique per process, or a stuck lease cannot be traced back to the
+# process holding it.
+node_id: "{{ ansible_facts.hostname }}"
+
+cloud_name: "{{ ferry_cloud_name }}"
+site_name: "{{ ferry_site_name }}"
+
+log:
+  level: "{{ ferry_log_level }}"
+  format: json
+{% if ferry_log_file_enabled | bool %}
+  file: /var/log/kolla/ferry/ferry-manager.log
+  file_max_mib: {{ ferry_log_file_max_mib }}
+  file_keep: {{ ferry_log_file_keep }}
+{% endif %}
+
+# Plain HTTP on the internal address. The tenant and operator surface is
+# Keystone-token authenticated, and TLS terminates at haproxy on the VIP the
+# same way it does for every other service on this cloud.
+api:
+  bind: "{{ api_interface_address | put_address_in_context('url') }}:{{ ferry_api_listen_port }}"
+  tls:
+    enabled: false
+
+{% if enable_ferry_mover | bool %}
+# The pull protocol. A work order carries the unwrapped per-domain DEK and the
+# repository's credentials inline, so this listener is mTLS by construction —
+# the manager refuses to start without require_client_cert — and being signed
+# by our CA is not enough on its own: one CN per mover, checked against the
+# mover_id in the request. Adding a mover means adding it to the ferry-mover
+# group and re-running, which reissues its certificate and extends this list.
+mover_api:
+  bind: "{{ api_interface_address | put_address_in_context('url') }}:{{ ferry_mover_api_listen_port }}"
+  tls:
+    enabled: true
+    cert_file: /etc/ferry/pki/mover-api-server.crt
+    key_file: /etc/ferry/pki/mover-api-server.key
+    client_ca_file: /etc/ferry/pki/ca.crt
+    require_client_cert: true
+    allowed_client_cns:
+{% for host in groups['ferry-mover'] | default([]) | sort %}
+      - "ferry-mover-{{ host }}"
+{% endfor %}
+    min_version: "1.3"
+{% endif %}
+
+# /metrics, /healthz, /readyz. Never fronted.
+admin:
+  enabled: true
+  bind: "{{ ferry_admin_bind_address | put_address_in_context('url') }}:{{ ferry_admin_port }}"
+  metrics: true
+  pprof: false
+
+db:
+  dsn: "{{ ferry_database_dsn }}"
+  migrate: true
+  # Not a free choice: the SELECT ... FOR UPDATE SKIP LOCKED it relies on needs MariaDB
+  # 10.6, and a manager running below it silently double-executes jobs.
+  assert_version: true
+
+keystone:
+  auth_url: "{{ keystone_internal_url }}/v3"
+  # An application credential, not the service password. Restricted role
+  # list, unrestricted=False, revocable on its own. It is also the only
+  # credential ferry-manager accepts — it validates tenant tokens
+  # with one, and the manager refuses to start without it.
+  application_credential_id: "{{ ferry_keystone_application_credential_id }}"
+  application_credential_secret: "{{ ferry_keystone_password_appcred }}"
+  # The service user's own password, alongside the application credential rather
+  # than instead of it. A restore creates its volumes through a Keystone trust,
+  # and trust auth carries a scope — which application-credential auth cannot.
+  # Without these, every restore, instant restore and standby promotion fails
+  # with no_trust_credential; the manager logs it at startup and /readyz says so.
+  username: "{{ ferry_keystone_user }}"
+  password: "{{ ferry_keystone_password }}"
+  user_domain_name: "{{ default_user_domain_name | default('Default') }}"
+  project_name: "{{ ferry_keystone_project }}"
+  project_domain_name: "{{ default_project_domain_name | default('Default') }}"
+  restore_trust_ttl: "{{ ferry_restore_trust_ttl }}"
+  region: "{{ openstack_region_name }}"
+  interface: internal
+{% if openstack_cacert | length > 0 and kolla_copy_ca_into_containers | bool %}
+  # service-cert-copy puts kolla's CA bundle beside this file, and this
+  # container's /etc/ferry is that directory.
+  ca_cert: "/etc/ferry/ca-certificates/{{ openstack_cacert | basename }}"
+{% endif %}
+  token_cache_ttl: 5m
+  token_cache_max: 4096
+  # The catalog belongs to kolla here. Ferry can assert its own entry on a loop
+  # and does on deployments with no other owner; with two writers and
+  # different opinions about the URL they rewrite each other every interval.
+  register_in_catalog: {{ ferry_register_in_catalog | bool | lower }}
+  service_name: ferry
+  service_type: backup
+  public_url: "{{ ferry_public_endpoint }}"
+  internal_url: "{{ ferry_internal_endpoint }}"
+  admin_url: "{{ ferry_internal_endpoint }}"
+
+# The key domain is the repository, not the cloud, and keys must follow
+# the data. The KEK is held by a managed key store — never a file on this node,
+# which precheck.yml refuses: a key with no replication and no backup is every
+# backup point in the repository resting on one disk.
+kms:
+  driver: "{{ ferry_kms_driver }}"
+{% if ferry_kms_driver == 'barbican' %}
+  barbican:
+    # A bare UUID or a full href; only the trailing id is stored in wrapped
+    # keys, so the repository stays readable from a differently-addressed
+    # Barbican. The endpoint is resolved from this cloud's catalog.
+    secret_id: "{{ ferry_kms_barbican_secret_id }}"
+{% elif ferry_kms_driver == 'vault' %}
+  vault:
+    address: "{{ ferry_kms_vault_address }}"
+    mount: "{{ ferry_kms_vault_mount }}"
+    key_name: "{{ ferry_kms_vault_key_name }}"
+{% if ferry_kms_vault_token_file %}
+    # A Vault Agent sink. The agent authenticates and renews; Ferry re-reads the
+    # file, so it never holds a credential that expires under it.
+    token_file: "{{ ferry_kms_vault_token_file }}"
+{% elif ferry_kms_vault_token %}
+    token: "{{ ferry_kms_vault_token }}"
+{% endif %}
+{% if ferry_kms_vault_role_id %}
+    # Present so the manager can say what to do with them. Ferry does no AppRole
+    # login: these need a Vault Agent, and token_file above is where its sink
+    # goes.
+    role_id: "{{ ferry_kms_vault_role_id }}"
+    secret_id: "{{ ferry_kms_vault_secret_id }}"
+{% endif %}
+{% endif %}
+
+{% if ferry_ceph_enabled | bool %}
+# The manager never reads a volume. This is the reconciler: Cinder
+# trash-moves an anchored image and Nova orphans one with no namespace to
+# enumerate it from, and both signals are deliberately Ceph-side because the
+# notification bus is best-effort and some operators disable it entirely.
+ceph:
+  conf: /etc/ceph/ceph.conf
+  user: "{{ ferry_ceph_manager_user }}"
+  volume_pools: {{ ferry_ceph_volume_pools | to_json }}
+  vm_pools: {{ ferry_ceph_vm_pools | to_json }}
+  remove_nova_orphans: {{ ferry_ceph_remove_nova_orphans | bool | to_json }}
+  volume_name_template: "{{ ferry_ceph_volume_name_template }}"
+  # The deliberate privilege split. These paths are read inside the MOVER's container,
+  # not this one: the manager keeps client.{{ ferry_ceph_manager_user }} for
+  # what only it does, and every work order tells the mover which identity to
+  # be. Without this the deployment would have to mount the manager's keyring
+  # into the mover to work at all.
+  mover:
+    user: "{{ ferry_ceph_mover_user }}"
+    keyring: "/etc/ceph/ceph.client.{{ ferry_ceph_mover_user }}.keyring"
+  # A third key rather than wider caps on the second, because a restore writes
+  # chunks INTO a live volume's RBD image — in a pool the mover's key is
+  # read-only on, on purpose. Only a restore work order carries it, so the
+  # component that runs unattended holding every unwrapped DEK still cannot
+  # write a tenant's disk.
+  restore:
+    user: "{{ ferry_ceph_restore_user }}"
+    keyring: "/etc/ceph/ceph.client.{{ ferry_ceph_restore_user }}.keyring"
+  mirror:
+    drive_schedule: {{ ferry_ceph_mirror_drive_schedule | bool | lower }}
+    enable_images: {{ ferry_ceph_mirror_enable_images | bool | lower }}
+{% else %}
+ceph:
+  conf: ""
+  volume_pools: []
+  vm_pools: []
+{% endif %}
+
+{% if enable_ferry_compute | bool %}
+# ferry-compute, for filesystem-consistent plans.
+compute:
+  enabled: true
+  scheme: https
+  port: {{ ferry_compute_api_port }}
+  timeout: 30s
+  max_freeze: {{ ferry_max_freeze }}
+  warn_above: 2s
+  require_quiesce: {{ ferry_require_quiesce | bool | lower }}
+  # The same agents as a READ path, not just a freeze one, and separate
+  # from `enabled` above because they are different powers: freezing a guest is
+  # a control operation, reading its disk is a data one.
+  #
+  # Without this the manager has no local-disk prober at all, and every disk on
+  # a backend it cannot read from the cluster is refused non_rbd_backend — even
+  # where the agent on the hypervisor holding it would happily serve the read.
+  local_disk:
+    enabled: {{ ferry_local_disk_backup | bool | lower }}
+{% if ferry_local_disk_backup | bool %}
+    # Short, because the answer genuinely changes: an agent restarted with the
+    # data path on should not have to wait out a long TTL to be noticed.
+    cache_ttl: {{ ferry_local_disk_cache_ttl }}
+    # An IDLE deadline handed to the agent as its own watchdog, so a mover that
+    # dies cannot leave QEMU serving NBD with a scratch file growing behind it.
+    # The agent renews it on every call, so it bounds "how long may nobody be
+    # listening", not how long a backup may take.
+    session_ttl: {{ ferry_local_disk_session_ttl }}
+{% endif %}
+  tls:
+    cert_file: /etc/ferry/pki/manager-client.crt
+    key_file: /etc/ferry/pki/manager-client.key
+    ca_file: /etc/ferry/pki/ca.crt
+  # nova hypervisor name -> the address that agent answers on, and the name its
+  # certificate carries.
+  hosts:
+{% for host in groups['ferry-compute'] | default([]) | sort %}
+    "{{ hostvars[host].ansible_facts.hostname }}": "{{ 'api' | kolla_address(host) }}"
+{% endfor %}
+{% for name, address in ferry_quiesce_extra_hosts.items() %}
+    "{{ name }}": "{{ address }}"
+{% endfor %}
+{% endif %}
+
+{% if ferry_enable_flr | bool %}
+# The manager's half of the mTLS to a mover's browse listener.
+#
+# The same trust boundary as the mover protocol itself: the request carries an
+# unwrapped DEK on the way in and a tenant's file contents on the way back. The
+# manager already holds a client certificate for the compute agents and the CA
+# that signs everything here, so this reuses both — the mover's browse listener
+# verifies the manager against that CA and refuses anything else.
+#
+# Empty would mean plaintext, which is only defensible when the manager and the
+# mover share a host and the listener is on loopback. It is not, because the
+# manager has to be able to dial it.
+flr:
+  client_cert: /etc/ferry/pki/manager-client.crt
+  client_key: /etc/ferry/pki/manager-client.key
+  ca_cert: /etc/ferry/pki/ca.crt
+{% endif %}
+
+{% if ferry_objects_enabled | bool and ferry_objects_endpoint %}
+# The RGW realm this site protects buckets through.
+#
+# Configuration rather than a registry entry, and that is the difference between
+# a gateway and a repository: a cloud has one RGW realm and several chunk
+# repositories. Empty means this cloud does not protect buckets, and a bucket
+# plan is refused with that as the reason rather than accepted and failed on its
+# first run.
+objects:
+  name: {{ ferry_objects_name }}
+  # RGW's S3 endpoint, configured rather than looked up in the catalog: a
+  # deployment registers the SWIFT-compatible endpoint as object-store and
+  # exposes S3 separately, so resolving through the catalog finds the Swift URL
+  # and then answers every S3 request with a 404.
+  endpoint: "{{ ferry_objects_endpoint }}"
+  region: {{ ferry_objects_region }}
+  # An RGW user with `system` set, which reads any bucket in the realm — the
+  # same privilege Ferry already holds over block storage. A backup at 02:00 has
+  # no caller token to build a trust from, so a per-tenant delegation cannot
+  # work for the scheduled half; a restore is caller-initiated and does use the
+  # tenant's own authority.
+  access_key: "{{ ferry_objects_access_key }}"
+  secret_key: "{{ ferry_objects_secret_key }}"
+  admin_path: {{ ferry_objects_admin_path }}
+  max_concurrent_gets: {{ ferry_objects_max_concurrent_gets }}
+{% if ferry_objects_data_pools %}
+  # The RGW pools bucket reads are charged against, so the per-pool ceilings bind on
+  # bucket work as they do on block work: the load lands on the same cluster.
+  data_pools: {{ ferry_objects_data_pools | to_json }}
+{% endif %}
+{% endif %}
+
+# The production-cluster budget. Every one of these is a ceiling: a work
+# order may ask for less, never for more.
+limits:
+  max_concurrent_reads_per_pool: {{ ferry_max_concurrent_reads_per_pool }}
+  osd_client_op_priority: {{ ferry_osd_client_op_priority }}
+  read_parallelism: {{ ferry_read_parallelism }}
+  upload_parallelism: {{ ferry_upload_parallelism }}
+  max_inflight_jobs: {{ ferry_max_inflight_jobs }}
+  pause_when_degraded: {{ ferry_pause_when_degraded | bool | lower }}
+
+{% if ferry_upload_sustained_bps | int > 0 or ferry_upload_rules | length > 0 %}
+# Site-wide, unlike the ceilings above: the manager divides this among
+# the movers that have work, so the number here is what the site's uplink sees.
+upload:
+  sustained_bps: {{ ferry_upload_sustained_bps | int }}
+{% if ferry_upload_burst_bps | int > 0 or ferry_upload_rules | selectattr('burst_bps', 'defined') | selectattr('burst_bps') | list | length > 0 %}
+  burst_bps: {{ ferry_upload_burst_bps | int }}
+  burst_for: {{ ferry_upload_burst_for }}
+  burst_every: {{ ferry_upload_burst_every }}
+{% endif %}
+{% if ferry_upload_rules | length > 0 %}
+  # The ceilings by schedule, on this host's clock. Outside every rule the
+  # pair above applies.
+  rules:
+{% for rule in ferry_upload_rules %}
+    - days: {{ rule.days | default([]) | to_json }}
+      from: "{{ rule.from }}"
+      to: "{{ rule.to }}"
+      sustained_bps: {{ rule.sustained_bps | default(0) | int }}
+      burst_bps: {{ rule.burst_bps | default(0) | int }}
+{% endfor %}
+{% endif %}
+{% endif %}
+
+loops:
+  copy:
+    enabled: {{ ferry_point_copy_enabled | bool | lower }}
+    interval: {{ ferry_point_copy_interval }}
+    batch: {{ ferry_point_copy_batch }}
+  policy_resolve:
+    interval: {{ ferry_policy_resolve_interval }}
+  soft_delete:
+    interval: {{ ferry_soft_delete_interval }}
+    batch: {{ ferry_soft_delete_batch }}
+  missed_ticks:
+    interval: {{ ferry_missed_tick_interval }}
+    batch: {{ ferry_missed_tick_batch }}
+  coverage:
+    enabled: {{ ferry_coverage_metrics_enabled | bool | lower }}
+    interval: {{ ferry_coverage_interval }}
+  policy_verify:
+    enabled: {{ ferry_policy_verify_enabled | bool | lower }}
+    interval: {{ ferry_policy_verify_interval }}
+    batch: {{ ferry_policy_verify_batch }}
+
+retention:
+  coverage_minimum_keep_all: "{{ ferry_coverage_minimum_keep_all }}"
+  coverage_requires_lock: {{ ferry_coverage_requires_lock | bool | lower }}
+  missed_tick_window: "{{ ferry_missed_tick_window }}"
+{% if ferry_retention_timezone %}
+  timezone: "{{ ferry_retention_timezone }}"
+{% endif %}
+
+gc:
+  # The only thing standing between a concurrent backup and data loss: a chunk
+  # is deleted when it is unreferenced AND older than this, which is why two
+  # concurrent sweeps reach the same conclusion.
+  grace_period: {{ ferry_gc_grace_period }}
+
+dr:
+  enabled: {{ ferry_dr_enabled | bool | lower }}
+  run_deadline: {{ ferry_dr_run_deadline }}
+  probe:
+    image: "{{ ferry_dr_probe_image }}"
+    flavor: "{{ ferry_dr_probe_flavor }}"
+    direct: {{ ferry_dr_probe_direct | bool | lower }}
+
+shutdown:
+  drain: 30s
+  grace: 15s
+{% if ferry_console_product_name or ferry_console_primary_color or ferry_console_files %}
+
+console:
+{% if ferry_console_product_name %}
+  product_name: {{ ferry_console_product_name | to_json }}
+{% endif %}
+{% for key, name in [('logo', ferry_console_logo), ('logo_dark', ferry_console_logo_dark), ('favicon', ferry_console_favicon), ('stylesheet', ferry_console_stylesheet)] if name %}
+  {{ key }}: "/etc/ferry/console/{{ name | basename }}"
+{% endfor %}
+{% if ferry_console_logo_only | bool %}
+  logo_only: true
+{% if ferry_console_logo_align %}
+  logo_align: "{{ ferry_console_logo_align }}"
+{% endif %}
+{% if ferry_console_logo_height | int > 0 %}
+  logo_height: {{ ferry_console_logo_height | int }}
+{% endif %}
+{% if ferry_console_logo_width | int > 0 %}
+  logo_width: {{ ferry_console_logo_width | int }}
+{% endif %}
+{% endif %}
+{% if ferry_console_primary_color %}
+  primary_color: "{{ ferry_console_primary_color }}"
+{% endif %}
+{% if ferry_console_primary_color_dark %}
+  primary_color_dark: "{{ ferry_console_primary_color_dark }}"
+{% endif %}
+{% endif %}

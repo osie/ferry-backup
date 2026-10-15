@@ -1,0 +1,261 @@
+{{- define "ferry.moverConfig" -}}
+site: {{ include "ferry.siteName" . | quote }}
+cloud: {{ include "ferry.cloudName" . | quote }}
+manager_url: {{ printf "https://%s.%s.svc:%v" (include "ferry.moverApiService" .) .Release.Namespace .Values.moverApi.service.port | quote }}
+listen: "0.0.0.0:9782"
+log_level: {{ .Values.logLevel | quote }}
+max_parallel: {{ .Values.mover.maxParallel }}
+{{- if .Values.ceph.enabled }}
+readable_pools: {{ include "ferry.readablePools" . }}
+writable_pools: {{ .Values.ceph.pools.ferry | toJson }}
+{{- end }}
+compute:
+  enabled: {{ and .Values.compute.enabled .Values.compute.localDiskBackup }}
+  {{- if and .Values.compute.enabled .Values.compute.localDiskBackup }}
+  {{- with include "ferry.computeTLSServerName" . }}
+  server_name: {{ . | quote }}
+  {{- end }}
+  timeout: 5m
+  {{- end }}
+image_parallelism: {{ .Values.mover.parallelism.image }}
+segment_parallelism: {{ .Values.mover.parallelism.segment }}
+read_parallelism: {{ .Values.mover.parallelism.read }}
+upload_parallelism: {{ .Values.mover.parallelism.upload }}
+gc_grace_period: {{ .Values.gc.moverGracePeriod | quote }}
+gc_temp_dir: /var/lib/ferry/gc
+poll_interval: 5s
+drain_timeout: {{ printf "%ds" (include "ferry.moverDrainSeconds" . | int) | quote }}
+repo_open_timeout: {{ .Values.mover.repoOpenTimeout | quote }}
+{{- end -}}
+{{- $full := include "ferry.fullname" . -}}
+{{- $movers := include "ferry.moverIdentities" . | fromJsonArray -}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "ferry.moverName" . }}
+  labels:
+    {{- include "ferry.componentLabels" (dict "root" . "component" "mover") | nindent 4 }}
+data:
+  mover.yaml: |
+    {{- mergeOverwrite (include "ferry.moverConfig" . | fromYaml) (deepCopy .Values.mover.extraConfig) | toYaml | nindent 4 }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "ferry.moverName" . }}
+  labels:
+    {{- include "ferry.componentLabels" (dict "root" . "component" "mover") | nindent 4 }}
+spec:
+  clusterIP: None
+  selector:
+    {{- include "ferry.selector" (dict "root" . "component" "mover") | nindent 4 }}
+  ports:
+    - name: admin
+      port: 9782
+      targetPort: admin
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "ferry.moverName" . }}
+  labels:
+    {{- include "ferry.componentLabels" (dict "root" . "component" "mover") | nindent 4 }}
+spec:
+  serviceName: {{ include "ferry.moverName" . }}
+  replicas: {{ .Values.mover.replicas }}
+  podManagementPolicy: Parallel
+  selector:
+    matchLabels:
+      {{- include "ferry.selector" (dict "root" . "component" "mover") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "ferry.componentLabels" (dict "root" . "component" "mover") | nindent 8 }}
+      annotations:
+        checksum/config: {{ include "ferry.moverConfig" . | sha256sum }}
+        {{- with .Values.mover.networks }}
+        k8s.v1.cni.cncf.io/networks: {{ . | quote }}
+        {{- end }}
+        {{- with .Values.mover.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      serviceAccountName: {{ include "ferry.serviceAccount" . }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.podSecurityContext }}
+      securityContext:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      terminationGracePeriodSeconds: {{ add (include "ferry.moverDrainSeconds" . | int) 60 }}
+      {{- if .Values.mover.awaitManagers }}
+      initContainers:
+        - name: await-managers
+          {{- include "ferry.image" (dict "root" . "image" .Values.images.mover) | nindent 10 }}
+          command: ["/usr/local/bin/ferry-mover", "await-managers"]
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: FERRY_MOVER_CONFIG
+              value: /etc/ferry/mover.yaml
+            - name: FERRY_MOVER_AWAIT_MANAGERS
+              value: {{ printf "%s.%s.svc:9777" (include "ferry.managerReplicasService" .) .Release.Namespace | quote }}
+            - name: FERRY_MOVER_CLIENT_CERT
+              value: "/etc/ferry/pki/movers/$(POD_NAME)/tls.crt"
+            - name: FERRY_MOVER_CLIENT_KEY
+              value: "/etc/ferry/pki/movers/$(POD_NAME)/tls.key"
+            - name: FERRY_MOVER_CA_CERT
+              value: "/etc/ferry/pki/movers/$(POD_NAME)/ca.crt"
+          {{- with .Values.securityContext }}
+          securityContext:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          volumeMounts:
+            - name: config
+              mountPath: /etc/ferry/mover.yaml
+              subPath: mover.yaml
+              readOnly: true
+            - name: pki
+              mountPath: /etc/ferry/pki/movers
+              readOnly: true
+      {{- end }}
+      containers:
+        - name: mover
+          {{- include "ferry.image" (dict "root" . "image" .Values.images.mover) | nindent 10 }}
+          command: ["/usr/local/bin/ferry-mover"]
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: FERRY_MOVER_CONFIG
+              value: /etc/ferry/mover.yaml
+            - name: FERRY_MOVER_ID
+              value: "$(POD_NAME)"
+            - name: FERRY_MOVER_CLIENT_CERT
+              value: "/etc/ferry/pki/movers/$(POD_NAME)/tls.crt"
+            - name: FERRY_MOVER_CLIENT_KEY
+              value: "/etc/ferry/pki/movers/$(POD_NAME)/tls.key"
+            - name: FERRY_MOVER_CA_CERT
+              value: "/etc/ferry/pki/movers/$(POD_NAME)/ca.crt"
+            {{- with .Values.mover.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          ports:
+            - name: admin
+              containerPort: 9782
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: admin
+            periodSeconds: 20
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: admin
+            periodSeconds: 10
+          {{- with .Values.mover.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.securityContext }}
+          securityContext:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          volumeMounts:
+            - name: config
+              mountPath: /etc/ferry/mover.yaml
+              subPath: mover.yaml
+              readOnly: true
+            - name: pki
+              mountPath: /etc/ferry/pki/movers
+              readOnly: true
+            - name: scratch
+              mountPath: /var/lib/ferry
+            {{- if .Values.ceph.enabled }}
+            - name: ceph
+              mountPath: /etc/ceph
+              readOnly: true
+            {{- end }}
+            {{- with .Values.mover.extraVolumeMounts }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+      volumes:
+        - name: config
+          configMap:
+            name: {{ include "ferry.moverName" . }}
+        - name: scratch
+          emptyDir:
+            sizeLimit: {{ .Values.mover.scratch.sizeLimit }}
+        - name: pki
+          projected:
+            sources:
+              {{- range $i, $id := $movers }}
+              - secret:
+                  {{- if eq $.Values.pki.provider "existing" }}
+                  name: {{ index $.Values.pki.existing.movers $i }}
+                  {{- else }}
+                  name: {{ printf "%s-%s" $full (trimPrefix (printf "%s-" $full) $id) }}
+                  {{- end }}
+                  items:
+                    - key: tls.crt
+                      path: {{ $id }}/tls.crt
+                    - key: tls.key
+                      path: {{ $id }}/tls.key
+                    - key: ca.crt
+                      path: {{ $id }}/ca.crt
+              {{- end }}
+        {{- if .Values.ceph.enabled }}
+        - name: ceph
+          projected:
+            sources:
+              {{- if .Values.ceph.conf.secret }}
+              - secret:
+                  name: {{ .Values.ceph.conf.secret }}
+                  items:
+                    - key: {{ .Values.ceph.conf.key }}
+                      path: ceph.conf
+              {{- else }}
+              - configMap:
+                  name: {{ .Values.ceph.conf.configMap }}
+                  items:
+                    - key: {{ .Values.ceph.conf.key }}
+                      path: ceph.conf
+              {{- end }}
+              - secret:
+                  name: {{ include "ferry.keyringSecret" . }}
+                  items:
+                    - key: {{ printf "ceph.client.%s.keyring" .Values.ceph.users.mover }}
+                      path: {{ printf "ceph.client.%s.keyring" .Values.ceph.users.mover }}
+                    - key: {{ printf "ceph.client.%s.keyring" .Values.ceph.users.restore }}
+                      path: {{ printf "ceph.client.%s.keyring" .Values.ceph.users.restore }}
+        {{- end }}
+        {{- with .Values.mover.extraVolumes }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      {{- with .Values.mover.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.mover.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- if .Values.mover.affinity }}
+      affinity:
+        {{- toYaml .Values.mover.affinity | nindent 8 }}
+      {{- else }}
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                topologyKey: kubernetes.io/hostname
+                labelSelector:
+                  matchLabels:
+                    {{- include "ferry.selector" (dict "root" . "component" "mover") | nindent 20 }}
+      {{- end }}

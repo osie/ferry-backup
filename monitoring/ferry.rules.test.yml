@@ -1,0 +1,97 @@
+rule_files:
+  - ferry.rules
+
+evaluation_interval: 1m
+
+tests:
+  - name: a missing object pages even when its series is born already counting it
+    interval: 1m
+    input_series:
+      - series: 'ferry_mover_lock_retentions_total{job="ferry_mover",instance="mover-a:9782",repository="lock-a",outcome="missing"}'
+        values: '_x10 1x30'
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: FerryReferencedObjectMissing
+        exp_alerts: []
+      - eval_time: 15m
+        alertname: FerryReferencedObjectMissing
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              job: ferry_mover
+              repository: lock-a
+              outcome: missing
+            exp_annotations:
+              summary: "Repository lock-a is missing an object a point references: deleted outside Ferry or too early"
+
+  - name: a missing object pages when its series was waiting at zero
+    interval: 1m
+    input_series:
+      - series: 'ferry_mover_lock_retentions_total{job="ferry_mover",instance="mover-a:9782",repository="lock-a",outcome="missing"}'
+        values: '0x90 1x30'
+    alert_rule_test:
+      - eval_time: 80m
+        alertname: FerryReferencedObjectMissing
+        exp_alerts: []
+      - eval_time: 95m
+        alertname: FerryReferencedObjectMissing
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              job: ferry_mover
+              repository: lock-a
+              outcome: missing
+            exp_annotations:
+              summary: "Repository lock-a is missing an object a point references: deleted outside Ferry or too early"
+
+  - name: a missing object pages after the mover restarted
+    interval: 1m
+    input_series:
+      - series: 'ferry_mover_lock_retentions_total{job="ferry_mover",instance="mover-a:9782",repository="lock-a",outcome="missing"}'
+        values: '2x90 _x5 1x30'
+    alert_rule_test:
+      - eval_time: 100m
+        alertname: FerryReferencedObjectMissing
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              job: ferry_mover
+              repository: lock-a
+              outcome: missing
+            exp_annotations:
+              summary: "Repository lock-a is missing an object a point references: deleted outside Ferry or too early"
+
+  - name: a re-uploaded chunk and quiet hours do not page
+    interval: 1m
+    input_series:
+      - series: 'ferry_mover_lock_retentions_total{job="ferry_mover",instance="mover-a:9782",repository="lock-a",outcome="missing"}'
+        values: '0x180'
+      - series: 'ferry_mover_lock_retentions_total{job="ferry_mover",instance="mover-a:9782",repository="lock-a",outcome="reuploaded"}'
+        values: '0x60 1x60 4x60'
+    alert_rule_test:
+      - eval_time: 70m
+        alertname: FerryReferencedObjectMissing
+        exp_alerts: []
+      - eval_time: 170m
+        alertname: FerryReferencedObjectMissing
+        exp_alerts: []
+
+  - name: a count from before the window does not keep paging
+    interval: 1m
+    input_series:
+      - series: 'ferry_mover_lock_retentions_total{job="ferry_mover",instance="mover-a:9782",repository="lock-a",outcome="missing"}'
+        values: '0x10 1x200'
+    alert_rule_test:
+      - eval_time: 30m
+        alertname: FerryReferencedObjectMissing
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              job: ferry_mover
+              repository: lock-a
+              outcome: missing
+            exp_annotations:
+              summary: "Repository lock-a is missing an object a point references: deleted outside Ferry or too early"
+      - eval_time: 150m
+        alertname: FerryReferencedObjectMissing
+        exp_alerts: []

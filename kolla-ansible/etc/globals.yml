@@ -1,0 +1,138 @@
+---
+# Ferry's settings for /etc/kolla/globals.yml. Copy the ones you need; every
+# value shown is the default unless marked REQUIRED.
+
+########################
+# On or off
+########################
+enable_ferry: "yes"
+
+# The data plane and the quiesce agent, separately. Without a mover Ferry
+# dispatches nothing; without the agent backups are crash-consistent, which is
+# a supported mode rather than a failure.
+#enable_ferry_mover: "yes"
+#enable_ferry_compute: "yes"
+
+########################
+# Images
+########################
+# Built from Ferry's source and published to GHCR. They are not
+# kolla images and do not come from kolla's registry.
+#ferry_image_registry: "ghcr.io"
+#ferry_image_namespace: "osie/ferry"
+#ferry_tag: "latest"
+
+# File-level restore drags in a libguestfs appliance measured in hundreds of
+# megabytes. Turning this on switches the mover to the -flr image.
+#ferry_enable_flr: false
+
+########################
+# Key management — REQUIRED
+########################
+# The KEK wraps every per-domain DEK, and the DEKs are only ever stored
+# wrapped. The KEK therefore IS the repository — lose it and every backup point
+# is unreadable.
+#
+# barbican or vault only. There is a `file` driver in ferry-manager and this
+# plugin refuses it: a key on local disk has no replication, no backup and no
+# audit trail, and it dies with the node.
+#ferry_kms_driver: "barbican"
+
+# REQUIRED with the barbican driver. Provisioned once, by hand:
+#   source /etc/kolla/admin-openrc.sh && kolla-ansible/tools/create-kek.sh
+ferry_kms_barbican_secret_id: ""
+
+# With the vault driver instead:
+#ferry_kms_driver: "vault"
+#ferry_kms_vault_address: "https://vault.example.net:8200"
+#ferry_kms_vault_mount: "transit"
+#ferry_kms_vault_key_name: "ferry"
+
+########################
+# Ceph — REQUIRED unless disabled
+########################
+# Ferry reads production RBD images directly; there is no Cinder or Nova API in
+# the data path. Put ceph.conf and three keyrings in
+# /etc/kolla/config/ferry/ceph/ — kolla-ansible/tools/create-cephx.sh mints them
+# with a deliberate privilege split.
+#
+# Set this false only for a control-plane smoke test. The manager will come up,
+# serve its API and register in the catalog; every plan will then be refused at
+# creation, because discovery cannot prove a resource is RBD-backed.
+#ferry_ceph_enabled: true
+
+# The pools Cinder and Nova use, if they are not kolla's defaults.
+#ferry_ceph_volume_pools: ["volumes"]
+#ferry_ceph_vm_pools: ["vms"]
+#ferry_ceph_image_pools: ["images"]
+
+# Ferry's own pools: the chunk repository when it is RADOS-backed, and the RBD
+# tier. Both are optional, but a mover is never dispatched work for a
+# pool it has not advertised.
+#ferry_ceph_own_pools: ["ferry-repo", "ferry-tier"]
+
+# Cinder does not publish volume_name_template through any API, so nothing can
+# derive it. A cloud configured with "%s" and left on this default has every
+# volume refused as "image does not exist".
+#ferry_ceph_volume_name_template: "volume-%s"
+
+########################
+# Naming
+########################
+# A cloud is an OpenStack deployment; a site is the locality domain movers and
+# repositories share. 1:1 for a single-region cloud.
+#ferry_cloud_name: "regionone"
+#ferry_site_name: "regionone"
+
+########################
+# Load on the production cluster
+########################
+# Ceilings, not targets. The fastest route to being uninstalled is making the
+# production cluster slow.
+#ferry_max_concurrent_reads_per_pool: 4
+#ferry_read_parallelism: 4
+#ferry_upload_parallelism: 4
+#ferry_max_inflight_jobs: 16
+#ferry_osd_client_op_priority: 1
+
+# A recovering cluster does not also get a backup run. Leave this on unless
+# your cluster is permanently HEALTH_WARN for a structural reason — a lab with
+# size-3 pools on two OSDs, say — in which case Ferry would otherwise never
+# dispatch anything at all.
+#ferry_pause_when_degraded: true
+
+# The site's uplink budget, in bytes/sec: site-wide, divided among the
+# movers that have work. 0 leaves uploads unmetered. Rules put the ceiling on
+# a schedule, on the manager host's clock; outside every rule the default
+# applies, and a rule with no burst_bps does not burst. Quote the hours.
+#ferry_upload_sustained_bps: 50000000        # 400 Mbit/s, the night's allowance
+#ferry_upload_burst_bps: 100000000
+#ferry_upload_rules:
+#  - days: [mon, tue, wed, thu, fri]
+#    from: "07:00"
+#    to: "21:00"
+#    sustained_bps: 12500000                 # 100 Mbit/s while the office is on the link
+
+########################
+# Quiesce
+########################
+# Off: a guest without tools gets a crash-consistent backup, reported, not a
+# failed one. Turning it on makes a filesystem-consistent plan fail instead.
+#ferry_require_quiesce: false
+#ferry_max_freeze: "30s"
+
+########################
+# Keystone
+########################
+# Ferry prefers an application credential over a service password.
+# kolla does not mint them; set both of these to use one you created yourself
+# and they take precedence over ferry_keystone_password.
+#ferry_keystone_application_credential_id: ""
+#ferry_keystone_application_credential_secret: ""
+
+########################
+# Ports
+########################
+#ferry_api_port: "9776"          # tenant/operator API and the SPA, on the VIP
+#ferry_mover_api_port: "9777"    # mover pull protocol, mTLS, internal only
+#ferry_compute_api_port: "9779"  # quiesce API, mTLS, dialled by managers only

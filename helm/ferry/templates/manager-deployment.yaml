@@ -1,0 +1,289 @@
+{{- $bootstrapDB := .Values.database.bootstrap.enabled }}
+{{- $bootstrapKS := .Values.keystone.bootstrap.enabled }}
+{{- $adminSecret := .Values.database.bootstrap.admin.secretName }}
+{{- $adminKey := .Values.database.bootstrap.admin.secretKey }}
+{{- if .Values.database.embedded.enabled }}
+{{- $adminSecret = include "ferry.credentialsSecret" . }}
+{{- $adminKey = "database-root-password" }}
+{{- end }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "ferry.fullname" . }}-manager
+  labels:
+    {{- include "ferry.componentLabels" (dict "root" . "component" "manager") | nindent 4 }}
+spec:
+  replicas: {{ .Values.manager.replicas }}
+  selector:
+    matchLabels:
+      {{- include "ferry.selector" (dict "root" . "component" "manager") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "ferry.componentLabels" (dict "root" . "component" "manager") | nindent 8 }}
+      annotations:
+        checksum/config: {{ include "ferry.managerConfig" . | sha256sum }}
+        {{- with .Values.manager.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      serviceAccountName: {{ include "ferry.serviceAccount" . }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.podSecurityContext }}
+      securityContext:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- if or $bootstrapDB $bootstrapKS }}
+      initContainers:
+        - name: bootstrap
+          {{- include "ferry.image" (dict "root" . "image" .Values.images.manager) | nindent 10 }}
+          args:
+            - bootstrap
+            {{- if $bootstrapDB }}
+            - --database
+            {{- end }}
+            {{- if $bootstrapKS }}
+            - --keystone
+            {{- end }}
+          {{- if $bootstrapKS }}
+          envFrom:
+            - secretRef:
+                name: {{ .Values.keystone.bootstrap.adminSecret }}
+          {{- end }}
+          env:
+            {{- if $bootstrapDB }}
+            - name: FERRY_DB_ADMIN_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $adminSecret }}
+                  key: {{ $adminKey }}
+            - name: FERRY_BOOTSTRAP_DB_ADMIN_DSN
+              value: {{ include "ferry.adminDSN" . | quote }}
+            - name: FERRY_BOOTSTRAP_DB_NAME
+              value: {{ .Values.database.name | quote }}
+            - name: FERRY_BOOTSTRAP_DB_USER
+              value: {{ .Values.database.user | quote }}
+            - name: FERRY_BOOTSTRAP_DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "ferry.credentialsSecret" . }}
+                  key: database-password
+            {{- end }}
+            {{- if $bootstrapKS }}
+            - name: FERRY_BOOTSTRAP_SERVICE_USER
+              value: {{ .Values.keystone.user | quote }}
+            - name: FERRY_BOOTSTRAP_SERVICE_USER_DOMAIN
+              value: {{ .Values.keystone.userDomain | quote }}
+            - name: FERRY_BOOTSTRAP_SERVICE_PROJECT
+              value: {{ .Values.keystone.project | quote }}
+            - name: FERRY_BOOTSTRAP_SERVICE_PROJECT_DOMAIN
+              value: {{ .Values.keystone.projectDomain | quote }}
+            - name: FERRY_BOOTSTRAP_SERVICE_ROLES
+              value: {{ join "," .Values.keystone.roles | quote }}
+            - name: FERRY_BOOTSTRAP_SERVICE_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "ferry.credentialsSecret" . }}
+                  key: keystone-password
+            {{- if .Values.keystone.caSecret }}
+            - name: OS_CACERT
+              value: /etc/ferry/keystone-ca/ca.crt
+            {{- end }}
+            {{- end }}
+          {{- with .Values.securityContext }}
+          securityContext:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- if .Values.keystone.caSecret }}
+          volumeMounts:
+            - name: keystone-ca
+              mountPath: /etc/ferry/keystone-ca
+              readOnly: true
+          {{- end }}
+      {{- end }}
+      containers:
+        - name: manager
+          {{- include "ferry.image" (dict "root" . "image" .Values.images.manager) | nindent 10 }}
+          args: ["--config=/etc/ferry/manager.yaml"]
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: FERRY_NODE_ID
+              value: "$(POD_NAME)"
+            - name: FERRY_DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "ferry.credentialsSecret" . }}
+                  key: database-password
+            - name: FERRY_DB_DSN
+              value: {{ include "ferry.dsn" . | quote }}
+            - name: FERRY_KEYSTONE_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "ferry.credentialsSecret" . }}
+                  key: keystone-password
+            - name: FERRY_KEYSTONE_APPLICATION_CREDENTIAL_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "ferry.credentialsSecret" . }}
+                  key: application-credential-secret
+            {{- with .Values.manager.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          ports:
+            - name: api
+              containerPort: 9776
+            - name: mover-api
+              containerPort: 9777
+            {{- if .Values.metrics.enabled }}
+            - name: admin
+              containerPort: 9775
+            {{- end }}
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: api
+            periodSeconds: 5
+            failureThreshold: 120
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: api
+            periodSeconds: 20
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: api
+            periodSeconds: 10
+          {{- with .Values.manager.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.securityContext }}
+          securityContext:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          volumeMounts:
+            - name: config
+              mountPath: /etc/ferry/manager.yaml
+              subPath: manager.yaml
+              readOnly: true
+            - name: mover-api-server
+              mountPath: /etc/ferry/pki/mover-api-server
+              readOnly: true
+            {{- if .Values.compute.enabled }}
+            - name: manager-client
+              mountPath: /etc/ferry/pki/manager-client
+              readOnly: true
+            {{- end }}
+            {{- if .Values.ceph.enabled }}
+            - name: ceph
+              mountPath: /etc/ceph
+              readOnly: true
+            {{- end }}
+            {{- if .Values.keystone.caSecret }}
+            - name: keystone-ca
+              mountPath: /etc/ferry/keystone-ca
+              readOnly: true
+            {{- end }}
+            {{- if eq .Values.kms.driver "vault" }}
+            - name: vault-token
+              mountPath: /etc/ferry/vault
+              readOnly: true
+            {{- end }}
+            {{- if .Values.console.filesConfigMap }}
+            - name: console
+              mountPath: /etc/ferry/console
+              readOnly: true
+            {{- end }}
+            {{- with .Values.manager.extraVolumeMounts }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+      volumes:
+        - name: config
+          configMap:
+            name: {{ include "ferry.fullname" . }}-manager
+        - name: mover-api-server
+          secret:
+            secretName: {{ include "ferry.pkiSecret" (dict "root" . "name" "mover-api-server") }}
+        {{- if .Values.compute.enabled }}
+        - name: manager-client
+          secret:
+            secretName: {{ include "ferry.pkiSecret" (dict "root" . "name" "manager-client") }}
+        {{- end }}
+        {{- if .Values.ceph.enabled }}
+        - name: ceph
+          projected:
+            sources:
+              {{- if .Values.ceph.conf.secret }}
+              - secret:
+                  name: {{ .Values.ceph.conf.secret }}
+                  items:
+                    - key: {{ .Values.ceph.conf.key }}
+                      path: ceph.conf
+              {{- else }}
+              - configMap:
+                  name: {{ .Values.ceph.conf.configMap }}
+                  items:
+                    - key: {{ .Values.ceph.conf.key }}
+                      path: ceph.conf
+              {{- end }}
+              - secret:
+                  name: {{ include "ferry.keyringSecret" . }}
+                  items:
+                    - key: {{ printf "ceph.client.%s.keyring" .Values.ceph.users.manager }}
+                      path: {{ printf "ceph.client.%s.keyring" .Values.ceph.users.manager }}
+                    - key: {{ printf "ceph.client.%s.keyring" .Values.ceph.users.restore }}
+                      path: {{ printf "ceph.client.%s.keyring" .Values.ceph.users.restore }}
+        {{- end }}
+        {{- if .Values.keystone.caSecret }}
+        - name: keystone-ca
+          secret:
+            secretName: {{ .Values.keystone.caSecret }}
+            items:
+              - key: {{ .Values.keystone.caKey }}
+                path: ca.crt
+        {{- end }}
+        {{- if eq .Values.kms.driver "vault" }}
+        - name: vault-token
+          secret:
+            secretName: {{ required "kms.vault.tokenSecret is required with the vault driver" .Values.kms.vault.tokenSecret }}
+            items:
+              - key: {{ .Values.kms.vault.tokenKey }}
+                path: token
+        {{- end }}
+        {{- if .Values.console.filesConfigMap }}
+        - name: console
+          configMap:
+            name: {{ .Values.console.filesConfigMap }}
+        {{- end }}
+        {{- with .Values.manager.extraVolumes }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      {{- with .Values.manager.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.manager.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- if .Values.manager.affinity }}
+      affinity:
+        {{- toYaml .Values.manager.affinity | nindent 8 }}
+      {{- else }}
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                topologyKey: kubernetes.io/hostname
+                labelSelector:
+                  matchLabels:
+                    {{- include "ferry.selector" (dict "root" . "component" "manager") | nindent 20 }}
+      {{- end }}

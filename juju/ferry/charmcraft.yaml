@@ -1,0 +1,235 @@
+name: ferry
+type: charm
+title: Ferry
+summary: Backup, recovery and DRaaS for OpenStack.
+description: |
+  Runs ferry-manager and ferry-mover on this machine, in containers, against the
+  cloud's own database, Keystone and Ceph. Pair it with the ferry-compute
+  subordinate on every hypervisor for filesystem-consistent backups and for
+  instances whose disks Ferry cannot read from the cluster.
+links:
+  source: https://github.com/osie/ferry-deploy
+base: ubuntu@24.04
+platforms:
+  amd64:
+parts:
+  charm:
+    plugin: charm
+    source: .
+    charm-binary-python-packages:
+      - ops
+      - PyYAML
+      - websocket-client
+assumes:
+  - juju >= 3.1
+
+requires:
+  shared-db:
+    interface: mysql-shared
+    limit: 1
+  database:
+    interface: mysql_client
+    limit: 1
+  identity-credentials:
+    interface: keystone-credentials
+    limit: 1
+  ceph:
+    interface: ceph-client
+    limit: 1
+  ceph-mover:
+    interface: ceph-client
+    limit: 1
+    optional: true
+  ceph-restore:
+    interface: ceph-client
+    limit: 1
+    optional: true
+
+provides:
+  compute:
+    interface: ferry-compute
+  metrics-endpoint:
+    interface: prometheus_scrape
+
+peers:
+  peers:
+    interface: ferry-peers
+
+resources:
+  manager-image:
+    type: file
+    filename: manager.tar
+    description: A docker-archive of the ferry-manager image, for machines that cannot reach the registry.
+  mover-image:
+    type: file
+    filename: mover.tar
+    description: A docker-archive of the ferry-mover image, for machines that cannot reach the registry.
+
+config:
+  options:
+    cloud-name:
+      type: string
+      default: ""
+      description: This deployment's name, recorded in every point. Defaults to the model's name.
+    site-name:
+      type: string
+      default: ""
+      description: The locality movers claim work from. Defaults to cloud-name.
+    region:
+      type: string
+      default: ""
+      description: Keystone region. Defaults to what the identity relation reports.
+    registry:
+      type: string
+      default: ghcr.io/osie
+      description: Where the ferry-manager, ferry-mover and ferry-compute images are pulled from.
+    version:
+      type: string
+      default: "0.17.0"
+      description: The image tag every unit and every hypervisor runs.
+    public-url:
+      type: string
+      default: ""
+      description: The catalog's public endpoint. Defaults to this unit's address.
+    service-type:
+      type: string
+      default: backup
+      description: The catalog service type Ferry registers under.
+    kms-driver:
+      type: string
+      default: none
+      description: none, barbican or vault.
+    barbican-secret-id:
+      type: string
+      default: ""
+      description: The Barbican secret holding the KEK, when kms-driver is barbican.
+    volume-pools:
+      type: string
+      default: cinder-ceph
+      description: Comma-separated Cinder RBD pools.
+    vm-pools:
+      type: string
+      default: ""
+      description: Comma-separated Nova RBD pools. Empty when Nova's disks are local.
+    mirror-drive-schedule:
+      type: boolean
+      default: false
+      description: >-
+        Let this manager take the rbd-mirror snapshots that replicate hot protection groups. Off,
+        the mirror relationship's own schedule takes them and this manager only watches.
+    mirror-enable-images:
+      type: boolean
+      default: false
+      description: >-
+        Let this manager enable snapshot mirroring on the images of a hot protection group's members
+        where the workload runs. Off, an image that is not mirror-enabled is named and its group is
+        unprotected.
+    remove-nova-orphans:
+      type: boolean
+      default: false
+      description: >-
+        Delete a vm-pools disk that Ferry's anchor snapshot kept after Nova deleted its instance.
+        Off, every instance deleted while Ferry anchored its disk leaves that disk in the pool at
+        full size for an operator to remove.
+    image-pools:
+      type: string
+      default: glance
+      description: Comma-separated Glance RBD pools.
+    volume-name-template:
+      type: string
+      default: "volume-%s"
+      description: Cinder's volume_name_template.
+    local-disk-backup:
+      type: boolean
+      default: true
+      description: Read disks Ferry cannot reach in the cluster through the hypervisor's agent.
+    dr-enabled:
+      type: boolean
+      default: false
+      description: >-
+        Let this manager release, recover, test, resync and retire protection groups. Off, every one
+        of those requests is refused with dr_not_enabled and GET /v1/capabilities reports dr false.
+    dr-run-deadline:
+      type: string
+      default: "12h"
+      description: How long a recover may run before it stops; a test also stops at its bubble policy's maximum duration.
+    dr-probe-image:
+      type: string
+      default: ""
+      description: >-
+        Glance image (name or id) a recover boots on each tier's network to run health checks, and a
+        bubble's jump host falls back to. Each Ferry release attaches it as ferry-probe-<version>.qcow2;
+        upload it with openstack image create ferry-probe --disk-format qcow2 --container-format bare
+        --property hw_serial_port_count=1 --public --file ferry-probe-<version>.qcow2.
+    dr-probe-flavor:
+      type: string
+      default: ""
+      description: Flavor (name or id) for the probe host and a jump host whose bubble policy names none.
+    dr-probe-direct:
+      type: boolean
+      default: false
+      description: Run a recover's health checks from this manager, which must then reach tenant networks.
+    mover-max-parallel:
+      type: int
+      default: 2
+      description: Jobs a mover runs at once.
+    mover-drain-timeout:
+      type: int
+      default: 90
+      description: Seconds a stopping mover lets its jobs finish before it hands the rest back to resume on another mover. The mover's unit waits a minute longer than this before it kills the container.
+    compute-port:
+      type: int
+      default: 9779
+      description: The port every ferry-compute agent listens on.
+    expose-metrics:
+      type: boolean
+      default: false
+      description: Bind the admin listeners of the manager, the mover and every ferry-compute agent on the metrics-endpoint binding's address instead of loopback, so Prometheus can scrape them. They serve per-project quota figures and /loglevel, so bind metrics-endpoint to a space only operators reach.
+    keystone-interface:
+      type: string
+      default: internal
+      description: The catalog interface Ferry uses to reach other services.
+    console-product-name:
+      type: string
+      default: ""
+      description: The name the console shows in place of Ferry.
+    console-primary-color:
+      type: string
+      default: ""
+      description: "The console's brand colour for buttons and highlights, as #rrggbb."
+    console-primary-color-dark:
+      type: string
+      default: ""
+      description: The brand colour on the dark theme. Empty means console-primary-color.
+    console-logo:
+      type: string
+      default: ""
+      description: The console's mark beside the product name, base64-encoded. svg, png, webp, gif, jpeg or ico, up to 1 MiB.
+    console-logo-dark:
+      type: string
+      default: ""
+      description: The mark on the console's dark theme, base64-encoded. Needs console-logo.
+    console-logo-only:
+      type: boolean
+      default: false
+      description: Show the logo alone, without the product name beside it; the name stays in the tab title. Needs console-logo.
+    console-logo-align:
+      type: string
+      default: ""
+      description: Where the logo alone sits in the sidebar, left or center. Needs console-logo-only.
+    console-logo-height:
+      type: int
+      default: 0
+      description: The logo alone's height in the sidebar in CSS pixels, 12 to 96; its width follows. Needs console-logo-only.
+    console-logo-width:
+      type: int
+      default: 0
+      description: The logo alone's width in the sidebar in CSS pixels, 12 to 208; its height follows. Needs console-logo-only.
+    console-favicon:
+      type: string
+      default: ""
+      description: The browser tab icon, base64-encoded. Empty means console-logo.
+    console-stylesheet:
+      type: string
+      default: ""
+      description: CSS loaded after the console's own to override its colour tokens, base64-encoded.

@@ -1,0 +1,63 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+env:
+  HELM_VERSION: v3.18.6
+
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: azure/setup-helm@v4
+        with:
+          version: ${{ env.HELM_VERSION }}
+
+      - name: The tag is a version, and every pin names it
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          if ! printf '%s' "$TAG" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$'; then
+            echo "::error::'$TAG' is not a release tag. Tag releases v<major>.<minor>.<patch>." >&2
+            exit 1
+          fi
+          make check-pins TAG="$TAG"
+
+      - name: The changelog describes this release
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          version="${TAG#v}"
+          awk -v v="$version" '$0 ~ "^## \\[" v "\\]" {f=1; next} f && /^## \[/ {exit} f && !/^\[[^]]+\]: /' CHANGELOG.md > release-notes.md
+          if [ ! -s release-notes.md ]; then
+            echo "::error::CHANGELOG.md has no section for $version." >&2
+            exit 1
+          fi
+
+      - name: Package
+        run: make package
+
+      - name: Push the chart to ghcr.io
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          owner=$(printf '%s' "${GITHUB_REPOSITORY_OWNER}" | tr '[:upper:]' '[:lower:]')
+          printf '%s' "$GITHUB_TOKEN" | helm registry login ghcr.io --username "${GITHUB_ACTOR}" --password-stdin
+          helm push dist/ferry-*.tgz "oci://ghcr.io/${owner}/charts"
+
+      - name: Publish the GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          gh release create "$TAG" dist/* --title "$TAG" --notes-file release-notes.md --verify-tag

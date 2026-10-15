@@ -1,0 +1,40 @@
+database:
+  host: mariadb.openstack.svc.cluster.local
+  bootstrap:
+    enabled: true
+    admin:
+      user: root
+      secretName: mariadb-dbadmin-password
+      secretKey: MYSQL_DBADMIN_PASSWORD
+
+keystone:
+  authUrl: http://keystone-api.openstack.svc.cluster.local:5000/v3
+  userDomain: default
+  projectDomain: default
+  bootstrap:
+    enabled: true
+    adminSecret: keystone-keystone-admin
+
+ceph:
+  conf:
+    configMap: ceph-etc
+  keyrings:
+    bootstrap:
+      enabled: true
+      adminSecret: pvc-ceph-client-key
+      adminKey: key
+  pools:
+    volumes: [cinder-volumes]
+    vms: [ephemeral]
+    images: [images]
+  volumeNameTemplate: "%s"
+
+compute:
+  nodeSelector:
+    openstack-compute-node: enabled
+  libvirt:
+    runDir: /run/libvirt
+    socket: libvirt-sock
+  qemu:
+    uid: 42424
+    gid: 42424

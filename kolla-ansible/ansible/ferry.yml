@@ -1,0 +1,209 @@
+---
+# The Ferry playbook. Runs in place of kolla-ansible's site.yml:
+#
+#   kolla-ansible deploy -i /etc/kolla/inventory -i /etc/kolla/ferry-groups \
+#     -p /usr/local/share/kolla-ansible/ansible/ferry.yml
+#
+# It lives inside kolla-ansible's own ansible/ directory rather than in this
+# git repository's tree, and kolla-ansible/install.sh is what puts it there.
+# That is not packaging preference: ansible resolves group_vars, filter
+# plugins, action plugins and library modules relative to the PLAYBOOK, so a
+# playbook outside that directory has no kolla_address, no merge_yaml, no
+# kolla_container and none of kolla's group_vars/all — which is most of what
+# the role is written against.
+
+- name: Gather facts
+  import_playbook: gather-facts.yml
+
+# site.yml builds these groups for its own services and we are not site.yml.
+# group_by is idempotent, so building them again costs nothing if a later
+# kolla run does it too.
+- name: Group hosts based on Ferry's configuration
+  hosts: all
+  gather_facts: false
+  max_fail_percentage: >-
+    {{ group_hosts_max_fail_percentage |
+       default(kolla_max_fail_percentage) |
+       default(100) }}
+  tasks:
+    # Here rather than in precheck.yml, for two reasons. `kolla-ansible deploy`
+    # never imports precheck.yml, so a gate there is absent from the run that
+    # actually builds the cloud; and the loadbalancer play below runs against a
+    # different host set, so a fact set in the ferry play is not in scope for
+    # it. This play is `hosts: all` and runs for every kolla_action.
+    - name: Checking the kolla-ansible release
+      run_once: true
+      ansible.builtin.fail:
+        msg: >-
+          Ferry needs kolla-ansible 2025.1 Epoxy or newer. This installation
+          has no roles/service-check, which arrived in 2025.1; globals.yml says
+          openstack_release is
+          {{ openstack_release | default('unset') }}, though that names an image
+          tag rather than the installed kolla-ansible.
+          On 2024.1 the kolla_container_facts module has no `action` parameter
+          and the prechecks fail outright. On 2024.2 it accepts `action` and
+          returns a flat result, so Ferry's port checks silently run against
+          containers it cannot see and a re-run against a live Ferry reports a
+          port already in use — a wrong answer rather than an error, which is
+          why that release is refused rather than worked around.
+      # The condition is spelled out here rather than referencing a role
+      # default, because this play runs no role.
+      #
+      # It probes for the service-check role, which kolla-ansible gained in
+      # 2025.1 alongside the nested kolla_container_facts result — the actual
+      # thing Ferry needs. NOT openstack_release: that is an image-tag intent
+      # an operator may legitimately override, and it demonstrably disagrees
+      # with the installed code (a 2025.1 checkout under a globals.yml pinning
+      # 2026.1 reports 2026.1). It is quoted in the message as a hint only.
+      #
+      # playbook_dir is kolla's ansible directory even though ferry.yml is a
+      # symlink into Ferry's tree — verified on 2025.1 and 2026.1. role_path
+      # would NOT be: that resolves into this repository, and probing relative
+      # to it would look for kolla's roles inside Ferry and refuse everything.
+      when: not ((playbook_dir ~ '/roles/service-check') is directory)
+
+    - name: Group hosts based on Kolla action
+      ansible.builtin.group_by:
+        key: "kolla_action_{{ kolla_action }}"
+      changed_when: false
+
+    - name: Group hosts based on enabled services
+      ansible.builtin.group_by:
+        key: "{{ item }}"
+      changed_when: false
+      with_items:
+        # `| default(false)` because this play runs no role, so the ferry
+        # role's defaults are not in scope. Operators set enable_ferry in
+        # globals.yml, which reaches ansible as extra-vars and wins anyway.
+        - "enable_ferry_{{ enable_ferry | default(false) | bool }}"
+        - "enable_loadbalancer_{{ enable_loadbalancer | bool }}"
+  tags: always
+
+# BEFORE the containers, not after, which is also the order site.yml uses.
+#
+# Two things in here are prerequisites rather than finishing touches. proxysql
+# has to know Ferry's database user before the manager authenticates as it, or
+# the manager is refused by a proxy that has never heard of the account — which
+# looks exactly like a wrong password. And haproxy has to be fronting 9777
+# before a mover looks for a manager there.
+#
+# The play is shaped exactly like site.yml's "Apply role loadbalancer": kolla's
+# own loadbalancer role first, then this service's fragments, then kolla's
+# container check, which notifies kolla's restart handlers. Those handlers are
+# the point. They restart haproxy on the backup nodes first and the VIP holder
+# last, stopping and starting keepalived around it so the VIP never lands on a
+# node whose haproxy is mid-restart. Ferry used to restart haproxy itself with a
+# bare container restart, which had none of that — and on a node where the
+# container had been started by hand outside its systemd unit, it re-attached
+# the unit and restarted nothing, reporting success. The handlers are defined
+# by the loadbalancer role, so that role has to be in the play; it is what
+# every kolla service run does too, and it is idempotent.
+- name: Configure loadbalancer for ferry
+  gather_facts: false
+  hosts:
+    - loadbalancer
+    - "&enable_loadbalancer_True"
+  serial: '{{ kolla_serial | default("0") }}'
+  max_fail_percentage: >-
+    {{ ferry_max_fail_percentage |
+       default(kolla_max_fail_percentage) |
+       default(100) }}
+  tags:
+    - ferry
+    - haproxy
+    - loadbalancer
+  roles:
+    - role: loadbalancer
+      # Not for stop, pull or precheck: `kolla-ansible stop -p ferry.yml` must
+      # stop Ferry, not the cloud's load balancer.
+      when:
+        - enable_ferry | default(false) | bool
+        - kolla_action in ['deploy', 'reconfigure', 'upgrade', 'config']
+  tasks:
+    - block:
+        - name: Configure loadbalancer for ferry
+          ansible.builtin.include_role:
+            name: ferry
+            tasks_from: loadbalancer
+        # The last step notifies the restart handlers if any of the
+        # configuration copied above changed — site.yml's own comment.
+        - name: Check loadbalancer containers for ferry
+          ansible.builtin.include_role:
+            name: loadbalancer
+            tasks_from: check-containers
+          when: kolla_action != 'config'
+      when:
+        # include_role is dynamic, so this is evaluated before the role's
+        # defaults are loaded — hence the default(false).
+        - enable_ferry | default(false) | bool
+        - enable_haproxy | bool or enable_proxysql | bool
+        - kolla_action in ['deploy', 'reconfigure', 'upgrade', 'config']
+
+# Three plays, because the rollout has an order and one play cannot express it:
+# managers migrate the schema and older binaries are then refused, so they roll
+# first, one at a time, each gated on /healthz before the next is touched.
+#
+# ferry_manager_serial and ferry_mover_serial (both 1) tune it, and belong in
+# globals.yml: `serial:` is read at play level, where role defaults do not
+# resolve, so setting them in the role would silently do nothing.
+- name: Apply role ferry to the managers
+  gather_facts: false
+  hosts:
+    - ferry-manager
+    - "&enable_ferry_True"
+  serial: '{{ ferry_manager_serial | default(1) }}'
+  max_fail_percentage: >-
+    {{ ferry_max_fail_percentage |
+       default(kolla_max_fail_percentage) |
+       default(100) }}
+  vars:
+    ferry_rollout_component: manager
+  roles:
+    - {role: ferry, tags: ferry}
+  post_tasks:
+    - name: Waiting for the ferry manager to answer
+      ansible.builtin.uri:
+        url: "http://{{ api_interface_address }}:{{ ferry_api_port }}/healthz"
+        status_code: [200]
+      register: ferry_manager_health
+      until: ferry_manager_health is success
+      retries: "{{ ferry_manager_health_retries | default(40) }}"
+      delay: "{{ ferry_manager_health_delay | default(5) }}"
+      changed_when: false
+      when:
+        - enable_ferry | default(false) | bool
+        - kolla_action in ['deploy', 'reconfigure', 'upgrade']
+      tags: ferry
+
+- name: Apply role ferry to the movers
+  gather_facts: false
+  hosts:
+    - ferry-mover
+    - ferry-mover-fabric
+    - "&enable_ferry_True"
+  serial: '{{ ferry_mover_serial | default(1) }}'
+  max_fail_percentage: >-
+    {{ ferry_max_fail_percentage |
+       default(kolla_max_fail_percentage) |
+       default(100) }}
+  vars:
+    ferry_rollout_component: mover
+  roles:
+    - {role: ferry, tags: ferry}
+
+# The agent holds no job and fronts no API, and this group is every hypervisor
+# in the cloud, so it rolls in parallel; kolla_serial still narrows it.
+- name: Apply role ferry to the compute agents
+  gather_facts: false
+  hosts:
+    - ferry-compute
+    - "&enable_ferry_True"
+  serial: '{{ kolla_serial | default("0") }}'
+  max_fail_percentage: >-
+    {{ ferry_max_fail_percentage |
+       default(kolla_max_fail_percentage) |
+       default(100) }}
+  vars:
+    ferry_rollout_component: compute
+  roles:
+    - {role: ferry, tags: ferry}

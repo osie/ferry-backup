@@ -1,0 +1,91 @@
+{{- if .Values.database.embedded.enabled }}
+{{- $full := include "ferry.fullname" . }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $full }}-mariadb
+  labels:
+    {{- include "ferry.componentLabels" (dict "root" . "component" "mariadb") | nindent 4 }}
+spec:
+  selector:
+    {{- include "ferry.selector" (dict "root" . "component" "mariadb") | nindent 4 }}
+  ports:
+    - name: mysql
+      port: {{ .Values.database.port }}
+      targetPort: mysql
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ $full }}-mariadb
+  labels:
+    {{- include "ferry.componentLabels" (dict "root" . "component" "mariadb") | nindent 4 }}
+spec:
+  serviceName: {{ $full }}-mariadb
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "ferry.selector" (dict "root" . "component" "mariadb") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "ferry.componentLabels" (dict "root" . "component" "mariadb") | nindent 8 }}
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.podSecurityContext }}
+      securityContext:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: mariadb
+          {{- include "ferry.image" (dict "root" . "image" .Values.images.mariadb) | nindent 10 }}
+          args:
+            - --character-set-server=utf8mb4
+            - --collation-server=utf8mb4_unicode_ci
+            - --innodb-snapshot-isolation=OFF
+          env:
+            - name: MARIADB_ROOT_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "ferry.credentialsSecret" . }}
+                  key: database-root-password
+            - name: MARIADB_AUTO_UPGRADE
+              value: "1"
+          ports:
+            - name: mysql
+              containerPort: 3306
+          readinessProbe:
+            exec:
+              command: ["healthcheck.sh", "--connect", "--innodb_initialized"]
+            periodSeconds: 10
+          livenessProbe:
+            exec:
+              command: ["healthcheck.sh", "--connect"]
+            initialDelaySeconds: 60
+            periodSeconds: 30
+          {{- with .Values.database.embedded.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.securityContext }}
+          securityContext:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/mysql
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: [ReadWriteOnce]
+        {{- with .Values.database.embedded.storageClass }}
+        storageClassName: {{ . }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.database.embedded.storage }}
+{{- end }}

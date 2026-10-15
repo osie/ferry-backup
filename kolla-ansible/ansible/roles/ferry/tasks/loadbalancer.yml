@@ -1,0 +1,28 @@
+---
+# The load balancer half of deploying Ferry, and it has to run BEFORE the
+# containers start — see ferry.yml for why the plays are in that order.
+#
+# Two consumers, not one:
+#
+#   haproxy   gets Ferry's frontends. Without them the API is not on the VIP
+#             and, more sharply, movers cannot reach the manager at all: the
+#             pull protocol is fronted in TCP mode on the internal VIP.
+#
+#   proxysql  gets Ferry's database user and its shard rules. Without them the
+#             manager authenticates against proxysql as a user proxysql has
+#             never heard of and is refused — which looks exactly like a wrong
+#             password and is not one.
+#
+# Restarts are not this file's business. ferry.yml runs kolla's loadbalancer
+# role and its container check around this include, exactly as site.yml does
+# for every service: the check notices a fragment that moved and notifies
+# kolla's own restart handlers, which carry the keepalived choreography. This
+# file only renders, through the same role every kolla service renders with.
+# haproxy-config names the fragment after the SERVICE key — ferry-manager.cfg —
+# not after the haproxy service names inside it.
+- name: "Configure loadbalancer for {{ project_name }}"
+  ansible.builtin.import_role:
+    name: loadbalancer-config
+  vars:
+    project_services: "{{ ferry_services }}"
+  tags: always

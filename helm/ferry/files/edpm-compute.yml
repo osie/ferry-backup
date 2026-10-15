@@ -1,0 +1,142 @@
+- hosts: all
+  become: true
+  gather_facts: false
+  vars:
+    ferry_src: /var/lib/openstack/configs/__SERVICE__
+    ferry_unit: edpm_ferry_compute
+  tasks:
+    - name: Create the agent's directories
+      ansible.builtin.file:
+        path: "{{ item.path }}"
+        state: directory
+        owner: "{{ item.owner | default('root') }}"
+        group: "{{ item.group | default('root') }}"
+        mode: "{{ item.mode }}"
+      loop:
+        - {path: /etc/ferry, mode: "0755"}
+        - {path: /etc/ferry/pki/compute-server, mode: "0700"}
+        - {path: /var/lib/ferry/compute, mode: "0700"}
+        - {path: "{{ '__SCRATCH__' | dirname }}", mode: "0755"}
+        - {path: "{{ '__SOCKETS__' | dirname }}", mode: "0755"}
+        - {path: __SCRATCH__, owner: "__QEMU_UID__", group: "__QEMU_GID__", mode: "0770"}
+        - {path: __SOCKETS__, owner: "__QEMU_UID__", group: "__QEMU_GID__", mode: "0770"}
+
+    - name: Label the scratch and socket directories for QEMU
+      ansible.builtin.shell: |
+        set -eu
+        selinuxenabled || { echo changed=0; exit 0; }
+        changed=0
+        for spec in "__SCRATCH__:svirt_image_t" "__SOCKETS__:qemu_var_run_t"; do
+          path=${spec%%:*}
+          type=${spec##*:}
+          if ! semanage fcontext -l -C | grep -F "$path(/.*)?" | grep -q "$type"; then
+            semanage fcontext -a -t "$type" "$path(/.*)?" 2>/dev/null || semanage fcontext -m -t "$type" "$path(/.*)?"
+            changed=1
+          fi
+          restorecon -R "$path"
+        done
+        echo changed=$changed
+      register: ferry_selinux
+      changed_when: "'changed=1' in ferry_selinux.stdout"
+
+    - name: Declare the agent's port to the EDPM firewall
+      ansible.builtin.copy:
+        dest: /var/lib/edpm-config/firewall/ferry-compute.yaml
+        mode: "0644"
+        content: |
+          - rule_name: 190 Allow Ferry compute agent
+            rule:
+              proto: tcp
+              dport:
+                - "__PORT__"
+
+    - name: Read the running firewall
+      ansible.builtin.command: nft list chain inet filter EDPM_INPUT
+      register: ferry_nft
+      changed_when: false
+      failed_when: false
+
+    - name: Admit the agent now, ahead of the next firewall run
+      ansible.builtin.command:
+        argv:
+          - nft
+          - insert
+          - rule
+          - inet
+          - filter
+          - EDPM_INPUT
+          - tcp
+          - dport
+          - "__PORT__"
+          - ct
+          - state
+          - new
+          - counter
+          - accept
+          - comment
+          - '"190 Allow Ferry compute agent"'
+      when:
+        - ferry_nft.rc == 0
+        - "'190 Allow Ferry compute agent' not in ferry_nft.stdout"
+
+    - name: Install the agent's configuration
+      ansible.builtin.copy:
+        src: "{{ ferry_src }}/compute.yaml"
+        dest: /etc/ferry/compute.yaml
+        mode: "0644"
+      register: ferry_config
+
+    - name: Install the agent's certificate
+      ansible.builtin.copy:
+        src: "{{ ferry_src }}/{{ item.name }}"
+        dest: "/etc/ferry/pki/compute-server/{{ item.name }}"
+        mode: "{{ item.mode }}"
+      loop:
+        - {name: tls.crt, mode: "0644"}
+        - {name: tls.key, mode: "0600"}
+        - {name: ca.crt, mode: "0644"}
+      register: ferry_pki
+
+    - name: Install the agent's unit
+      ansible.builtin.copy:
+        dest: "/etc/systemd/system/{{ ferry_unit }}.service"
+        mode: "0644"
+        content: |
+          [Unit]
+          Description=Ferry compute agent
+          After=network-online.target virtqemud.socket
+          Wants=network-online.target
+
+          [Service]
+          Restart=always
+          RestartSec=5
+          ExecStartPre=-/usr/bin/podman rm -f ferry_compute
+          ExecStart=/usr/bin/podman run --rm --name ferry_compute --net host --pull missing \
+            --log-driver none --security-opt label=disable \
+            -e FERRY_NODE_ID={{ canonical_hostname | default(inventory_hostname) }} \
+            -e FERRY_API_BIND={{ ctlplane_ip | default(ansible_host) }}:__PORT__ \
+            -v /etc/ferry/compute.yaml:/etc/ferry/compute.yaml:ro \
+            -v /etc/ferry/pki/compute-server:/etc/ferry/pki/compute-server:ro \
+            -v /run/libvirt:/run/libvirt \
+            -v /var/lib/ferry/compute:/var/lib/ferry/compute \
+            -v /var/lib/libvirt:/var/lib/libvirt \
+            -v /var/lib/nova:/var/lib/nova \
+            __IMAGE__ --config=/etc/ferry/compute.yaml
+          ExecStop=/usr/bin/podman stop -t 30 ferry_compute
+
+          [Install]
+          WantedBy=multi-user.target
+      register: ferry_unit_file
+
+    - name: Start the agent
+      ansible.builtin.systemd:
+        name: "{{ ferry_unit }}"
+        enabled: true
+        state: started
+        daemon_reload: "{{ ferry_unit_file is changed }}"
+
+    - name: Restart the agent onto what changed
+      ansible.builtin.systemd:
+        name: "{{ ferry_unit }}"
+        state: restarted
+      when: ferry_config is changed or ferry_pki is changed or ferry_unit_file is changed

@@ -1,0 +1,453 @@
+---
+- name: Precheck ferry configuration
+  ansible.builtin.import_role:
+    name: service-precheck
+  vars:
+    service_precheck_services: "{{ ferry_services }}"
+    service_name: "{{ project_name }}"
+
+- name: Checking that a manager is mapped somewhere
+  run_once: true
+  ansible.builtin.fail:
+    msg: >-
+      The ferry-manager group is empty. Ferry needs at least one control-plane
+      host; see kolla-ansible/inventory/ferry-groups for the groups to add to
+      your kolla inventory.
+  when: groups['ferry-manager'] | default([]) | length == 0
+
+# "file" is refused and "none" is not, and the difference is the point.
+#
+# A DEK is only ever stored wrapped, so the KEK is the whole repository: a key
+# on local disk has no replication, no backup and no audit trail, and it dies
+# with the node — taking every point with it. That is a trap, so it fails here.
+#
+# "none" is not that trap. It is a cloud that has no key manager and does not
+# pretend to: backups, restores and replication all work, and a plan that asks
+# for encryption is refused when it is CREATED rather than quietly written in
+# the clear. Refusing it here conflated "no key manager" with "a KEK somewhere
+# it will be lost", and told an operator who had chosen honestly that their
+# cloud could not run Ferry at all.
+- name: Checking that the KEK does not live on local disk
+  run_once: true
+  ansible.builtin.fail:
+    msg: >-
+      ferry_kms_driver is "file", which keeps the KEK on local disk. A DEK is
+      never stored unwrapped, so that one file is every backup point in the
+      repository: lose it and all of them are permanently unreadable. Use
+      "barbican" or "vault" — or "none", which encrypts nothing and says so.
+  when: ferry_kms_driver == 'file'
+
+- name: Checking that the key store is one this plugin supports
+  run_once: true
+  ansible.builtin.fail:
+    msg: >-
+      ferry_kms_driver is "{{ ferry_kms_driver }}". This plugin supports
+      "barbican", "vault", and "none" — the last meaning this cloud has no key
+      manager, so workloads are unencrypted and a plan that asks for encryption
+      is refused at creation.
+  when: ferry_kms_driver not in ['barbican', 'vault', 'none', 'file']
+
+- name: Checking that Barbican holds a KEK for Ferry
+  run_once: true
+  ansible.builtin.fail:
+    msg: >-
+      ferry_kms_barbican_secret_id is not set. Provisioning the key that
+      decrypts every backup is an operator action, not a side effect of a
+      deploy: run kolla-ansible/tools/create-kek.sh and put the secret id it
+      prints in globals.yml. If Barbican is not deployed on this cloud, set
+      enable_barbican in globals.yml, or point ferry_kms_driver at vault.
+  when:
+    - ferry_kms_driver == 'barbican'
+    - ferry_kms_barbican_secret_id | length == 0
+
+- name: Checking that Barbican is enabled on this cloud
+  run_once: true
+  ansible.builtin.fail:
+    msg: >-
+      ferry_kms_driver is "barbican" but enable_barbican is false. Ferry
+      resolves the key manager from this cloud's own catalog.
+  when:
+    - ferry_kms_driver == 'barbican'
+    - not enable_barbican | bool
+
+- name: Checking that Vault is addressable
+  run_once: true
+  ansible.builtin.fail:
+    msg: "ferry_kms_driver is \"vault\" but ferry_kms_vault_address is not set."
+  when:
+    - ferry_kms_driver == 'vault'
+    - ferry_kms_vault_address | length == 0
+
+# Ferry reads production RBD images directly; there is no Cinder or Nova API in
+# the data path. Without these files the manager comes up and then
+# refuses every plan at creation time, which is a much worse place to find out.
+- name: Checking that Ferry's Ceph configuration is present
+  run_once: true
+  delegate_to: localhost
+  become: false
+  ansible.builtin.stat:
+    path: "{{ ferry_ceph_config_dir }}/{{ item }}"
+  register: ferry_ceph_files
+  loop:
+    - "ceph.conf"
+    - "ceph.client.{{ ferry_ceph_manager_user }}.keyring"
+    - "ceph.client.{{ ferry_ceph_mover_user }}.keyring"
+    - "ceph.client.{{ ferry_ceph_restore_user }}.keyring"
+  when: ferry_ceph_enabled | bool
+
+- name: Failing when Ferry's Ceph configuration is incomplete
+  run_once: true
+  vars:
+    missing: "{{ ferry_ceph_files.results | rejectattr('stat.exists') | map(attribute='item') | list }}"
+  ansible.builtin.fail:
+    msg: >-
+      Missing from {{ ferry_ceph_config_dir }}: {{ missing | join(', ') }}.
+      Run kolla-ansible/tools/create-cephx.sh, which mints the three identities
+      with their deliberate caps — the manager's, the mover's read-only one, and the
+      restore key that is the only one able to write a live volume.
+  when:
+    - ferry_ceph_enabled | bool
+    - missing | length > 0
+
+- name: Get container facts
+  become: true
+  kolla_container_facts:
+    action: get_containers
+    container_engine: "{{ kolla_container_engine }}"
+    name:
+      - ferry_manager
+      - ferry_mover
+      - ferry_compute
+  check_mode: false
+  register: container_facts
+
+- name: Checking free port for the ferry API
+  ansible.builtin.wait_for:
+    host: "{{ api_interface_address }}"
+    port: "{{ ferry_api_listen_port }}"
+    connect_timeout: 1
+    timeout: 1
+    state: stopped
+  when:
+    - container_facts.containers['ferry_manager'] is not defined
+    - inventory_hostname in groups['ferry-manager']
+
+- name: Checking free port for the ferry mover API
+  ansible.builtin.wait_for:
+    host: "{{ api_interface_address }}"
+    port: "{{ ferry_mover_api_listen_port }}"
+    connect_timeout: 1
+    timeout: 1
+    state: stopped
+  when:
+    - container_facts.containers['ferry_manager'] is not defined
+    - inventory_hostname in groups['ferry-manager']
+    - enable_ferry_mover | bool
+
+- name: Checking free port for the ferry compute agent
+  ansible.builtin.wait_for:
+    host: "{{ api_interface_address }}"
+    port: "{{ ferry_compute_api_port }}"
+    connect_timeout: 1
+    timeout: 1
+    state: stopped
+  when:
+    - container_facts.containers['ferry_compute'] is not defined
+    - inventory_hostname in groups['ferry-compute'] | default([])
+    - enable_ferry_compute | bool
+
+###############################################################################
+# The storage fabric. Every check here is on the fabric movers only; a
+# Ceph-only cloud has none and skips the lot.
+#
+# These are prechecks rather than runtime errors on purpose. Everything below
+# fails at the first attach, which for most deployments is the first RESTORE —
+# months after the deploy, during an incident, with an error naming os-brick.
+###############################################################################
+
+- name: Checking that a non-ceph cinder backend has somewhere to be restored to
+  run_once: true
+  ansible.builtin.fail:
+    msg: >-
+      This cloud has cinder backends that are not ceph
+      ({{ ferry_non_ceph_backends | join(', ') }}), and the ferry-mover-fabric
+      group is empty. Ferry can back those volumes up through the compute agent,
+      and it cannot restore onto them: a volume that is not an rbd image is
+      written by attaching it, and only a host in that group can. Add two or
+      three movers that are zoned into the storage fabric — see
+      kolla-ansible/inventory/ferry-groups.
+  when:
+    - ferry_non_ceph_backends | default([]) | length > 0
+    - groups['ferry-mover-fabric'] | default([]) | length == 0
+    - ferry_precheck_fabric | bool
+
+- name: Checking that the iSCSI transport module is available
+  ansible.builtin.command:
+    cmd: modinfo iscsi_tcp
+  changed_when: false
+  failed_when: false
+  register: ferry_iscsi_modinfo
+  when:
+    - inventory_hostname in groups['ferry-mover-fabric'] | default([])
+    - ferry_fabric_iscsi | bool
+
+- name: Checking that iscsi_tcp can be loaded
+  ansible.builtin.fail:
+    msg: >-
+      iscsi_tcp is not available on this host, so it cannot log in to an iSCSI
+      target and cannot attach a cinder volume. Ferry loads and persists the
+      module during deploy, but it cannot install a kernel that does not have
+      it — install the distribution's kernel modules package, or take this host
+      out of ferry-mover-fabric if it reaches the array over Fibre Channel
+      only, in which case set ferry_fabric_iscsi to false.
+  when:
+    - inventory_hostname in groups['ferry-mover-fabric'] | default([])
+    - ferry_fabric_iscsi | bool
+    - ferry_iscsi_modinfo.rc | default(1) != 0
+
+# The initiator name is deliberately not prechecked.
+#
+# It lives in a volume, not on the host, and the mover image ships iscsi-iname
+# and seeds it on first start. Checking the host's /etc/iscsi would fail a
+# perfectly good deployment whose hosts have never installed open-iscsi for
+# their own sake — which is most of them.
+
+# NVMe-oF needs a transport module that Ubuntu does not install by default: both
+# nvme_tcp and nvmet_tcp live in linux-modules-extra, and a deployment that turns
+# NVMe on without it gets a modprobe failure during config-host, or worse, a
+# connector that reports properties happily and cannot connect anything.
+- name: Checking that the NVMe-oF transport module is available
+  become: true
+  ansible.builtin.command:
+    cmd: modinfo nvme_tcp
+  changed_when: false
+  failed_when: false
+  register: ferry_nvme_modinfo
+  when:
+    - inventory_hostname in groups['ferry-mover-fabric'] | default([])
+    - ferry_fabric_nvmeof | bool
+
+- name: Checking that nvme_tcp can be loaded
+  ansible.builtin.fail:
+    msg: >-
+      ferry_fabric_nvmeof is on and {{ inventory_hostname }} has no nvme_tcp
+      module. On Ubuntu it ships in linux-modules-extra-{{ ansible_facts.kernel }},
+      which is not installed by default; on RHEL-family hosts it is in the base
+      kernel package. Install it, or set ferry_fabric_nvmeof to false — Ferry
+      cannot load a module the host does not have, and os-brick's failure without
+      it names a device rather than a module.
+  when:
+    - inventory_hostname in groups['ferry-mover-fabric'] | default([])
+    - ferry_fabric_nvmeof | bool
+    - ferry_nvme_modinfo.rc | default(1) != 0
+
+# A fabric mover has to be the only iSCSI stack on its host, and the reason is
+# not tidiness.
+#
+# iscsiadm and iscsid talk over a private IPC whose structures are not stable
+# across releases. Ferry's mover image is Debian's open-iscsi; a co-located
+# daemon is whatever the cloud's own containers ship. Mismatched, iscsiadm
+# reaches the daemon and is misparsed: every login fails with "iSCSI driver not
+# found" on a host whose module is loaded and whose transport is present in
+# sysfs. Measured on 2.1.11 against 2.1.9, where discovery succeeds and login
+# never does — which is about the most misleading pair of symptoms available.
+- name: Looking for another iSCSI daemon on this host
+  become: true
+  ansible.builtin.shell:
+    # No Go template here on purpose: --format needs braces this file cannot
+    # spell without escaping, and an escape that renders wrong fails open —
+    # empty output reads as "no other daemon", which is the answer that lets the
+    # deployment through.
+    cmd: |
+      if [ -n "$({{ kolla_container_engine }} ps --filter name=iscsid --filter status=running -q 2>/dev/null)" ]; then
+        echo "the iscsid container"
+      fi
+      if systemctl is-active iscsid >/dev/null 2>&1; then
+        echo "the host's iscsid service"
+      fi
+      true
+  changed_when: false
+  failed_when: false
+  register: ferry_other_iscsid
+  when:
+    - inventory_hostname in groups['ferry-mover-fabric'] | default([])
+    - ferry_fabric_iscsi | bool
+
+- name: Checking that this host runs no other iSCSI daemon
+  ansible.builtin.fail:
+    msg: >-
+      {{ inventory_hostname }} is a fabric mover and already runs another iSCSI
+      daemon ({{ ferry_other_iscsid.stdout_lines | join(', ') }}). Ferry's mover
+      would then talk to that daemon rather than its own, and the two are
+      compatible only if they are the same open-iscsi release — which they are
+      not, because the mover image is not built from the same base as the
+      cloud's. The symptom is a login that fails with "iSCSI driver not found"
+      while the module is loaded and discovery against the same portal works.
+      Use a host that does not run iscsid; a fabric mover does not have to be a
+      controller, a hypervisor or a cinder-volume host, and should not be.
+  when:
+    - inventory_hostname in groups['ferry-mover-fabric'] | default([])
+    - ferry_fabric_iscsi | bool
+    - ferry_precheck_fabric | bool
+    - ferry_other_iscsid.stdout | default('') | trim | length > 0
+
+- name: Checking that a fabric mover is not also a hypervisor
+  ansible.builtin.fail:
+    msg: >-
+      {{ inventory_hostname }} is in both ferry-mover-fabric and the compute
+      group. A fabric mover runs privileged with the host's /dev and attaches
+      LUNs of its own, and putting that on a hypervisor means one host holding
+      both every tenant's running disks and Ferry's write path to the array.
+      Use hosts that are not hypervisors.
+  when:
+    - inventory_hostname in groups['ferry-mover-fabric'] | default([])
+    - inventory_hostname in groups['compute'] | default([])
+    - ferry_precheck_fabric | bool
+
+###############################################################################
+# The local-disk data path
+###############################################################################
+
+- name: Checking that something can serve local disks
+  ansible.builtin.fail:
+    msg: >-
+      ferry_local_disk_backup is on and no host is in the ferry-compute group.
+      Reading a Nova local disk or an attached LUN means asking the agent on the
+      hypervisor holding it, so with none deployed every such disk is
+      unprotected — and the plan will not say so until a backup dead-letters.
+  run_once: true
+  when:
+    - ferry_local_disk_backup | bool
+    - groups['ferry-compute'] | default([]) | length == 0
+
+- name: Checking that a mover can reach the compute agents
+  ansible.builtin.fail:
+    msg: >-
+      ferry_local_disk_backup is on and no host is in the ferry-mover group.
+      The agent serves disk contents; a mover is what reads them and writes them
+      to the repository.
+  run_once: true
+  when:
+    - ferry_local_disk_backup | bool
+    - groups['ferry-mover'] | default([]) | length == 0
+
+# The one that is worth a precheck rather than a comment, because the failure it
+# prevents is unreadable: QEMU reports "No such file or directory" for a scratch
+# file ferry-compute has just successfully created, and every obvious reading of
+# that message is wrong.
+- name: Checking that QEMU can see the backup scratch directory
+  ansible.builtin.fail:
+    msg: >-
+      backup scratch and socket directories must be under /var/lib/libvirt when
+      libvirt runs in a container, and these are not:
+      {{ [ferry_compute_scratch_dir, ferry_compute_socket_dir]
+         | reject('match', '^/var/lib/libvirt/') | list | join(', ') }}.
+      The process that opens them is QEMU, inside nova_libvirt, so a path only
+      ferry-compute can see does not exist as far as QEMU is concerned. It fails
+      at blockdev-add with "No such file or directory", naming a file that is
+      plainly there.
+  when:
+    - ferry_local_disk_backup | bool
+    - inventory_hostname in groups['ferry-compute'] | default([])
+    - enable_nova_libvirt_container | default(true) | bool
+    - "[ferry_compute_scratch_dir, ferry_compute_socket_dir] | reject('match', '^/var/lib/libvirt/') | list | length > 0"
+
+# Scratch grows with guest WRITES for the life of a session. Sharing a
+# filesystem with the instances means a long backup of a write-heavy guest can
+# stop every guest on the node, which is a far worse outcome than a failed
+# backup.
+- name: Reading the filesystem holding the instances
+  become: true
+  ansible.builtin.command:
+    cmd: "stat -f -c %i /var/lib/nova"
+  changed_when: false
+  failed_when: false
+  register: ferry_nova_fsid
+  when:
+    - ferry_local_disk_backup | bool
+    - inventory_hostname in groups['ferry-compute'] | default([])
+    - ferry_precheck_scratch_filesystem | bool
+
+# Resolved rather than taken literally: /var/lib/libvirt inside the agent is a
+# volume, and the identically-named directory on the host — if one exists at all
+# — is a different directory on a possibly different filesystem. Statting that
+# one answers a question nobody asked.
+- name: Finding the libvirt state directory
+  become: true
+  ansible.builtin.command:
+    # Plain JSON rather than --format: a Go template is two braces the command
+    # module splits into separate arguments, and it needs a shell it does not get.
+    cmd: "{{ kolla_container_engine }} volume inspect {{ ferry_libvirt_volume }}"
+  changed_when: false
+  failed_when: false
+  register: ferry_libvirt_volume_precheck
+  when:
+    - ferry_local_disk_backup | bool
+    - inventory_hostname in groups['ferry-compute'] | default([])
+    - ferry_precheck_scratch_filesystem | bool
+    - not ferry_libvirt_volume.startswith('/')
+
+- name: Reading the filesystem holding the scratch
+  become: true
+  vars:
+    ferry_libvirt_state_dir: "{{ (ferry_libvirt_volume_precheck.stdout | from_json)[0].Mountpoint
+                                 if ferry_libvirt_volume_precheck.stdout | default('') else ferry_libvirt_volume }}"
+  ansible.builtin.command:
+    cmd: "stat -f -c %i {{ ferry_libvirt_state_dir }}"
+  changed_when: false
+  failed_when: false
+  register: ferry_scratch_fsid
+  when:
+    - ferry_local_disk_backup | bool
+    - inventory_hostname in groups['ferry-compute'] | default([])
+    - ferry_precheck_scratch_filesystem | bool
+
+- name: Warning when the scratch shares a filesystem with the instances
+  ansible.builtin.debug:
+    msg: >-
+      {{ ferry_compute_scratch_dir }} is on the same filesystem as
+      /var/lib/nova. QEMU's copy-before-write scratch grows with guest writes
+      for as long as a backup session lives, so a long backup of a write-heavy
+      guest can fill the filesystem the instances are running from. Set
+      ferry_compute_max_scratch_bytes, or give the scratch its own filesystem.
+      Set ferry_precheck_scratch_filesystem to false to silence this.
+  when:
+    - ferry_local_disk_backup | bool
+    - inventory_hostname in groups['ferry-compute'] | default([])
+    - ferry_precheck_scratch_filesystem | bool
+    - ferry_nova_fsid.rc | default(1) == 0
+    - ferry_scratch_fsid.rc | default(1) == 0
+    - ferry_nova_fsid.stdout == ferry_scratch_fsid.stdout
+
+# F6. ferry_cloud_name defaults to the Keystone region, and on most OpenStack
+# installs that is "regionone" — so two independent deployments writing to one
+# repository end up sharing a name without anybody choosing it.
+#
+# The name is load-bearing. A recovery profile declares the cloud whose points
+# it translates and is selected by that name; a restore naming a target
+# cloud is refused by any manager that is not it. Both are string
+# comparisons, so a shared name makes both match too much, and one cloud's
+# networks, AZs and volume types get applied to the other cloud's workload.
+#
+# The manager now detects the collision once points from both clouds are in a
+# repository it catalogues, and refuses to resolve a profile against an
+# ambiguous name. This is the earlier half of that: said at deploy time, while
+# changing the answer is still free. A warning rather than a failure — a
+# single-cloud estate is the common case and is perfectly correct on the
+# default, and failing it would make a working deployment un-runnable over a
+# hazard it does not have.
+- name: Warning when this cloud's name is one every other cloud also has
+  run_once: true
+  ansible.builtin.debug:
+    msg: >-
+      ferry_cloud_name is "{{ ferry_cloud_name }}", taken from the Keystone
+      region, which is the default on most OpenStack installs. It is stamped
+      into every point object this cloud writes and is how another cloud picks
+      the recovery profile that translates them, so if a second deployment ever
+      writes to the same repository under this name, neither can be told from
+      the other and a cross-cloud restore lands on the wrong networks. Set
+      ferry_cloud_name to something that identifies this deployment. Set
+      ferry_precheck_cloud_name to false to silence this.
+  when:
+    - ferry_precheck_cloud_name | bool
+    - ferry_cloud_name in ferry_generic_cloud_names

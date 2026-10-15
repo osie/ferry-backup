@@ -1,0 +1,16 @@
+name: Feature request
+description: A distribution, a setting or a deployment shape the manifests do not cover
+labels: [enhancement]
+body:
+  - type: textarea
+    id: need
+    attributes:
+      label: What you need
+      description: The cloud, the deployer and what you are trying to do.
+    validations:
+      required: true
+  - type: textarea
+    id: today
+    attributes:
+      label: What you do today
+      description: How you work around it now, if you do.

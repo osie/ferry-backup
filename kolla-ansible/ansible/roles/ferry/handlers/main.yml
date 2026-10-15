@@ -1,0 +1,63 @@
+---
+# Every handler is guarded by the same mapping check the tasks use.
+#
+# Not belt-and-braces: kolla_container's recreate_or_restart_container CREATES
+# the container when it is not there. A handler notified on a host that does
+# not run that service would therefore start one — a mover on a control-only
+# host, holding keys it should never see. Some tasks here notify all three
+# handlers because they loop over every service, so the guard is what keeps
+# that safe.
+
+- name: Restart ferry-manager container
+  vars:
+    service_name: "ferry-manager"
+    service: "{{ ferry_services[service_name] }}"
+  become: true
+  kolla_container:
+    action: "recreate_or_restart_container"
+    common_options: "{{ docker_common_options }}"
+    name: "{{ service.container_name }}"
+    image: "{{ service.image }}"
+    volumes: "{{ service.volumes | reject('equalto', '') | list }}"
+    dimensions: "{{ service.dimensions }}"
+  when: service | service_enabled_and_mapped_to_host
+
+- name: Restart ferry-mover container
+  vars:
+    service_name: "ferry-mover"
+    service: "{{ ferry_services[service_name] }}"
+  become: true
+  kolla_container:
+    action: "recreate_or_restart_container"
+    common_options: "{{ docker_common_options }}"
+    name: "{{ service.container_name }}"
+    image: "{{ service.image }}"
+    volumes: "{{ service.volumes | reject('equalto', '') | list }}"
+    dimensions: "{{ service.dimensions }}"
+    # recreate_or_restart_container RECREATES, from exactly the parameters given
+    # here — so anything this handler omits is silently dropped from the
+    # container it rebuilds. Leaving privileged out cost a fabric mover its
+    # ability to attach the first time its config changed, and nothing said so:
+    # the container came back healthy, the connector failed at privsep, and the
+    # mover correctly stopped advertising a capability it no longer had.
+    privileged: "{{ service.privileged | default(false) | bool }}"
+    # Same rule as privileged: recreation rebuilds from exactly what is passed,
+    # so anything omitted here is silently dropped from the container.
+    environment: "{{ service.environment | default({}) }}"
+    graceful_timeout: "{{ service.graceful_timeout }}"
+    client_timeout: "{{ service.client_timeout }}"
+  when: service | service_enabled_and_mapped_to_host
+
+- name: Restart ferry-compute container
+  vars:
+    service_name: "ferry-compute"
+    service: "{{ ferry_services[service_name] }}"
+  become: true
+  kolla_container:
+    action: "recreate_or_restart_container"
+    common_options: "{{ docker_common_options }}"
+    name: "{{ service.container_name }}"
+    image: "{{ service.image }}"
+    volumes: "{{ service.volumes | reject('equalto', '') | list }}"
+    dimensions: "{{ service.dimensions }}"
+  when: service | service_enabled_and_mapped_to_host

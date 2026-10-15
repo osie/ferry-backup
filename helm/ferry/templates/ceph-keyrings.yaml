@@ -1,0 +1,134 @@
+{{- if and .Values.ceph.enabled .Values.ceph.keyrings.bootstrap.enabled (not .Values.ceph.keyrings.existingSecret) }}
+{{- $full := include "ferry.fullname" . }}
+{{- $b := .Values.ceph.keyrings.bootstrap }}
+{{- $p := .Values.ceph.pools }}
+{{- $u := .Values.ceph.users }}
+{{- $rw := list }}
+{{- $ro := list }}
+{{- range concat $p.volumes $p.vms }}{{ $rw = append $rw (printf "profile rbd pool=%s" .) }}{{ $ro = append $ro (printf "profile rbd-read-only pool=%s" .) }}{{ end }}
+{{- $img := list }}
+{{- range $p.images }}{{ $img = append $img (printf "profile rbd-read-only pool=%s" .) }}{{ end }}
+{{- $own := list }}
+{{- range $p.ferry }}{{ $own = append $own (printf "profile rbd pool=%s" .) }}{{ end }}
+{{- $caps := dict
+  $u.manager (join ", " (concat $rw $img $own))
+  $u.mover (join ", " (concat $ro $img $own))
+  $u.restore (join ", " (concat $rw $img $own)) }}
+{{- $script := include "ferry.cephKeyringScript" (dict "root" . "caps" $caps) }}
+{{- $pod := list $script (include "ferry.componentLabels" (dict "root" . "component" "ceph-keyrings")) (include "ferry.image" (dict "root" . "image" .Values.images.cephHelper)) .Values.imagePullSecrets .Release.Namespace (include "ferry.keyringSecret" .) $b .Values.ceph.conf }}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ $full }}-ceph-keyrings
+  labels:
+    {{- include "ferry.labels" . | nindent 4 }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ $full }}-ceph-keyrings
+  labels:
+    {{- include "ferry.labels" . | nindent 4 }}
+rules:
+  - apiGroups: [""]
+    resources: [secrets]
+    verbs: [create]
+  - apiGroups: [""]
+    resources: [secrets]
+    resourceNames: [{{ include "ferry.keyringSecret" . | quote }}]
+    verbs: [get, update, patch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ $full }}-ceph-keyrings
+  labels:
+    {{- include "ferry.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ $full }}-ceph-keyrings
+subjects:
+  - kind: ServiceAccount
+    name: {{ $full }}-ceph-keyrings
+    namespace: {{ .Release.Namespace }}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ $full }}-ceph-keyrings
+  labels:
+    {{- include "ferry.labels" . | nindent 4 }}
+data:
+  keyrings.sh: |
+    {{- $script | nindent 4 }}
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ $full }}-ceph-keyrings-{{ $pod | toJson | sha256sum | trunc 8 }}
+  labels:
+    {{- include "ferry.labels" . | nindent 4 }}
+spec:
+  backoffLimit: 20
+  ttlSecondsAfterFinished: 86400
+  template:
+    metadata:
+      labels:
+        {{- include "ferry.componentLabels" (dict "root" . "component" "ceph-keyrings") | nindent 8 }}
+    spec:
+      restartPolicy: OnFailure
+      serviceAccountName: {{ $full }}-ceph-keyrings
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: keyrings
+          {{- include "ferry.image" (dict "root" . "image" .Values.images.cephHelper) | nindent 10 }}
+          command: ["/bin/bash", "/opt/ferry/keyrings.sh"]
+          env:
+            - name: NAMESPACE
+              value: {{ .Release.Namespace }}
+            - name: SECRET
+              value: {{ include "ferry.keyringSecret" . }}
+            - name: ADMIN_USER
+              value: {{ $b.adminUser }}
+          volumeMounts:
+            - name: script
+              mountPath: /opt/ferry
+            - name: conf
+              mountPath: /etc/ferry-ceph-conf
+            - name: admin
+              mountPath: /etc/ferry-ceph-admin
+      volumes:
+        - name: script
+          configMap:
+            name: {{ $full }}-ceph-keyrings
+        - name: conf
+          configMap:
+            name: {{ .Values.ceph.conf.configMap }}
+            items:
+              - key: {{ .Values.ceph.conf.key }}
+                path: ceph.conf
+        - name: admin
+          secret:
+            secretName: {{ $b.adminSecret }}
+            items:
+              - key: {{ $b.adminKey }}
+                path: key
+{{- end }}
+
+{{- define "ferry.cephKeyringScript" -}}
+set -euo pipefail
+mkdir -p /etc/ceph /tmp/keyrings
+cp /etc/ferry-ceph-conf/ceph.conf /etc/ceph/ceph.conf
+printf '[client.%s]\n  key = %s\n' "$ADMIN_USER" "$(cat /etc/ferry-ceph-admin/key)" > "/etc/ceph/ceph.client.$ADMIN_USER.keyring"
+export CEPH_ARGS="--id $ADMIN_USER"
+{{- range $user, $osd := .caps }}
+ceph auth get-or-create {{ printf "client.%s" $user | quote }} >/dev/null
+ceph auth caps {{ printf "client.%s" $user | quote }} mon "profile rbd" osd {{ $osd | quote }}
+ceph auth get {{ printf "client.%s" $user | quote }} > {{ printf "/tmp/keyrings/ceph.client.%s.keyring" $user | quote }}
+{{- end }}
+kubectl -n "$NAMESPACE" create secret generic "$SECRET" --from-file=/tmp/keyrings --dry-run=client -o yaml | kubectl apply -f -
+{{- end -}}

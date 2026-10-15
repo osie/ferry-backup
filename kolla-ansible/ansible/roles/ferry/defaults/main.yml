@@ -1,0 +1,1075 @@
+---
+####################
+# Services
+####################
+# Three containers, three groups, and the split between them is a deliberate
+# boundary rather than packaging taste:
+#
+#   ferry-manager  control plane. API, scheduler, conductor, reconciler. Owns
+#                  the database and the Keystone credential.
+#   ferry-mover    data plane. Holds unwrapped encryption keys and talks to
+#                  object storage; holds no database credential and never talks
+#                  to OpenStack. A mover that OOMs on a large volume must not
+#                  take the API down with it.
+#   ferry-compute  quiesce agent. fsfreeze through libvirt's qemu-agent channel
+#                  and nothing else. No data path, no database, no credential.
+#
+# None of the three sets `command`: each image's entrypoint is its own binary
+# and each binary's default configuration path is /etc/ferry/<name>.yaml, which
+# is exactly where this role mounts it. Passing `command` would also make
+# kolla_container's compare_container report a difference on every run — it
+# compares the command against the container's Path, which is the entrypoint.
+ferry_rollout_component: ""
+ferry_services:
+  ferry-manager:
+    container_name: ferry_manager
+    group: ferry-manager
+    enabled: "{{ ferry_rollout_component in ['', 'manager'] }}"
+    image: "{{ ferry_manager_image_full }}"
+    volumes: "{{ ferry_manager_default_volumes + ferry_manager_extra_volumes }}"
+    dimensions: "{{ ferry_manager_dimensions }}"
+    haproxy:
+      ferry_api:
+        enabled: "{{ enable_ferry }}"
+        mode: "http"
+        external: false
+        port: "{{ ferry_api_port }}"
+        listen_port: "{{ ferry_api_listen_port }}"
+        backend_http_extra:
+          # /healthz is the one route on this listener that answers without a
+          # Keystone token. It is liveness only and touches nothing external,
+          # so a database blip cannot get every replica taken out of the pool
+          # at once.
+          - "option httpchk GET /healthz"
+          - "http-check expect status 200"
+      ferry_api_external:
+        enabled: "{{ enable_ferry }}"
+        mode: "http"
+        external: true
+        external_fqdn: "{{ ferry_external_fqdn }}"
+        port: "{{ ferry_api_public_port }}"
+        listen_port: "{{ ferry_api_listen_port }}"
+        backend_http_extra:
+          - "option httpchk GET /healthz"
+          - "http-check expect status 200"
+      ferry_mover_api:
+        # TCP, not HTTP: this listener requires a client certificate and binds
+        # mover_id to its CN, so haproxy has to pass the TLS session through
+        # rather than terminate it. Internal only — it carries unwrapped DEKs.
+        enabled: "{{ enable_ferry_mover }}"
+        mode: "tcp"
+        external: false
+        port: "{{ ferry_mover_api_port }}"
+        listen_port: "{{ ferry_mover_api_listen_port }}"
+  ferry-mover:
+    container_name: ferry_mover
+    group: ferry-mover
+    enabled: "{{ enable_ferry_mover | bool and ferry_rollout_component in ['', 'mover'] }}"
+    image: "{{ ferry_mover_image_full }}"
+    volumes: "{{ ferry_mover_default_volumes + ferry_mover_fabric_volumes + ferry_mover_extra_volumes }}"
+    dimensions: "{{ ferry_mover_dimensions }}"
+    # Attaching a LUN means talking to the SCSI stack, so a mover in the fabric
+    # runs the way kolla runs nova_compute. Every other mover does not, and this
+    # is the whole difference between them: one image, two ways of running it.
+    privileged: "{{ ferry_mover_is_fabric | bool }}"
+    environment: "{{ (ferry_mover_fabric_env if ferry_mover_is_fabric | bool else {})
+                     | combine(ferry_mover_flr_env) }}"
+    graceful_timeout: "{{ ferry_mover_stop_timeout }}"
+    client_timeout: "{{ ferry_mover_stop_timeout | int + 30 }}"
+  ferry-compute:
+    container_name: ferry_compute
+    group: ferry-compute
+    enabled: "{{ enable_ferry_compute | bool and ferry_rollout_component in ['', 'compute'] }}"
+    image: "{{ ferry_compute_image_full }}"
+    volumes: "{{ ferry_compute_default_volumes + ferry_compute_extra_volumes }}"
+    # Opening a device node needs this, not a capability: the container's device
+    # cgroup denies the open outright, and cap_add does not lift it. So the one
+    # setting that mounts /dev is also the one that makes this agent privileged.
+    privileged: "{{ ferry_compute_block_restore | bool }}"
+    dimensions: "{{ ferry_compute_dimensions }}"
+
+####################
+# Docker
+####################
+# Ferry's images are not kolla images: they are built from Ferry's source and
+# published to GHCR, so they come from their own registry rather than from
+# docker_image_url.
+ferry_image_registry: "ghcr.io"
+ferry_image_namespace: "osie/ferry"
+ferry_image_url: "{{ ferry_image_registry }}/{{ ferry_image_namespace }}-"
+# A RELEASE, not `latest`.
+#
+# `latest` moves on every commit to develop — images.yml rebuilds it per push —
+# so a deployment tracking it gets whatever landed this afternoon, and two hosts
+# deployed an hour apart can run different code. That is the opposite of what a
+# pin is for, and it is the reason release.yml exists.
+#
+# Move it deliberately, and read the release notes when you do: a release
+# carrying a migration cannot be rolled back past, because the manager applies
+# migrations at startup and Migrate's checksum guard then refuses an older
+# binary against the newer schema. Managers roll forward first.
+ferry_tag: "0.17.0"
+
+# How long the rolling deploy waits for a manager to answer before it moves to
+# the next one: 40 × 5s. The serial counts themselves are NOT here — `serial:`
+# is read at play level, where role defaults are out of scope, so they only
+# resolve from globals.yml; ferry.yml documents them.
+ferry_manager_health_retries: 40
+ferry_manager_health_delay: 5
+
+ferry_manager_image: "{{ ferry_image_url }}manager"
+ferry_manager_tag: "{{ ferry_tag }}"
+ferry_manager_image_full: "{{ ferry_manager_image }}:{{ ferry_manager_tag }}"
+
+# The mover is built from the same tree as the manager whose orders it
+# executes. Keep the two tags equal even when a release gives the mover
+# nothing.
+ferry_mover_image: "{{ ferry_image_url }}mover{{ '-flr' if ferry_enable_flr | bool else '' }}"
+ferry_mover_tag: "{{ ferry_tag }}"
+ferry_mover_image_full: "{{ ferry_mover_image }}:{{ ferry_mover_tag }}"
+
+ferry_compute_image: "{{ ferry_image_url }}compute"
+ferry_compute_tag: "{{ ferry_tag }}"
+ferry_compute_image_full: "{{ ferry_compute_image }}:{{ ferry_compute_tag }}"
+
+# File-level restore drags in a libguestfs appliance measured in hundreds of
+# megabytes, so it is a separate image and most deployments never want it.
+ferry_enable_flr: false
+
+# What the FLR browser needs to be reachable.
+#
+# The image alone is not enough, and the failure without this is a browse that
+# opens and then cannot be dialled: the manager proxies a tenant's file listing
+# to the mover holding the session, so the mover has to listen somewhere the
+# manager can reach and SAY where. The default listen address is loopback and
+# the default advertised address is empty, which together mean "this mover can
+# run a browse and nothing can talk to it" — reported as flr_unavailable, with
+# exactly these two variables named.
+ferry_mover_flr_env: "{{ {
+    'FERRY_FLR_ENABLED': '1',
+    'FERRY_FLR_LISTEN': '0.0.0.0:' ~ ferry_flr_port,
+    'FERRY_FLR_ADVERTISE': api_interface_address ~ ':' ~ ferry_flr_port,
+    'FERRY_FLR_MAX_SESSIONS': ferry_flr_max_sessions | string,
+    'FERRY_FLR_IDLE_TIMEOUT': ferry_flr_idle_timeout,
+    'FERRY_FLR_TLS_CERT': '/etc/ferry/pki/mover.crt',
+    'FERRY_FLR_TLS_KEY': '/etc/ferry/pki/mover.key',
+    'FERRY_FLR_CLIENT_CA': '/etc/ferry/pki/ca.crt',
+  } if ferry_enable_flr | bool else {} }}"
+
+ferry_flr_port: 9778
+# Each session costs a libguestfs appliance — a real VM — so this is a memory
+# ceiling as much as a concurrency one.
+ferry_flr_max_sessions: 4
+ferry_flr_idle_timeout: "15m"
+
+ferry_manager_dimensions: "{{ default_container_dimensions }}"
+ferry_mover_dimensions: "{{ default_container_dimensions }}"
+ferry_compute_dimensions: "{{ default_container_dimensions }}"
+
+ferry_extra_volumes: "{{ default_extra_volumes }}"
+ferry_manager_extra_volumes: "{{ ferry_extra_volumes }}"
+ferry_mover_extra_volumes: "{{ ferry_extra_volumes }}"
+ferry_compute_extra_volumes: "{{ ferry_extra_volumes }}"
+
+# Each container gets its own config directory mounted at /etc/ferry, which is
+# where every binary looks by default. The Ceph directory is a subdirectory of
+# that same tree mounted a second time at /etc/ceph, because librados takes a
+# path rather than a handle.
+ferry_manager_default_volumes:
+  - "{{ node_config_directory }}/ferry-manager/:/etc/ferry/:ro"
+  - "kolla_logs:/var/log/kolla/"
+  - "{{ (node_config_directory ~ '/ferry-manager/ceph/:/etc/ceph/:ro') if ferry_ceph_enabled | bool else '' }}"
+  - "/etc/localtime:/etc/localtime:ro"
+  - "ferry_manager:/var/lib/ferry/"
+ferry_mover_default_volumes:
+  - "{{ node_config_directory }}/ferry-mover/:/etc/ferry/:ro"
+  - "kolla_logs:/var/log/kolla/"
+  - "{{ (node_config_directory ~ '/ferry-mover/ceph/:/etc/ceph/:ro') if ferry_ceph_enabled | bool else '' }}"
+  - "/etc/localtime:/etc/localtime:ro"
+  - "ferry_mover:/var/lib/ferry/mover/"
+# The fabric half, empty on every mover that is not in the storage fabric.
+#
+# /dev is where the device appears; /lib/modules is what lets the SCSI stack
+# load what it needs; /etc/iscsi holds this host initiator identity, on a named
+# volume so it survives the container and the array ACL stays valid; and the
+# lock directory is where os-brick serialises logins.
+ferry_mover_fabric_volumes: "{{ ferry_mover_fabric_volume_list if ferry_mover_is_fabric | bool else [] }}"
+ferry_mover_fabric_volume_list:
+  - "/dev:/dev"
+  # Shared, and this one is load-bearing rather than conventional.
+  #
+  # iscsiadm is a client: it talks to iscsid over a socket in /run. A host
+  # running OpenStack compute already HAS an iscsid — kolla gives it one — and
+  # sharing /run is what lets this mover use that daemon instead of starting a
+  # second one. Two iscsid daemons doing session recovery over the same kernel
+  # sessions is how a host loses paths under load. This is also exactly what
+  # kolla mounts into nova_compute, for the same reason.
+  - "/run:/run{{ ':shared' if kolla_container_engine == 'docker' else '' }}"
+  - "/lib/modules:/lib/modules:ro"
+  - "/sys/kernel/config:/configfs"
+  # The initiator name is this mover's identity to the array, and Cinder ACLs
+  # whatever we send — so it has to outlive the container, or every deploy
+  # leaves a trail of dead ACLs behind it.
+  #
+  # kolla's own volume where kolla runs iscsid, because then the host has one
+  # initiator name and one daemon and they agree. A volume of our own only where
+  # there is no iscsid to share with.
+  - "{{ 'iscsi_info:/etc/iscsi' if ferry_fabric_share_iscsid | bool else 'ferry_iscsi:/etc/iscsi' }}"
+  # The NVMe host identity, for the same reason and on the same terms: hostnqn
+  # is what an NVMe array ACLs, and one that changed with the container would
+  # leave dead ACLs behind it. kolla has no volume of its own for this — it does
+  # not manage /etc/nvme for nova either — so this one is always Ferry's.
+  - "ferry_nvme:/etc/nvme"
+  - "{{ ferry_fabric_lock_dir }}:{{ ferry_fabric_lock_dir }}:rw"
+
+# Whether kolla already runs an iscsid on this host to share with.
+ferry_fabric_share_iscsid: "{{ enable_iscsid | default(false) | bool }}"
+
+# Whether THIS host is a fabric mover. A group membership rather than a flag,
+# because being in the fabric is zoning and initiator registration on a real
+# array — per host, and not something a deploy can conjure.
+ferry_mover_is_fabric: "{{ inventory_hostname in groups['ferry-mover-fabric'] | default([]) }}"
+
+ferry_compute_default_volumes:
+  - "{{ node_config_directory }}/ferry-compute/:/etc/ferry/:ro"
+  - "kolla_logs:/var/log/kolla/"
+  - "/etc/localtime:/etc/localtime:ro"
+  # The DIRECTORY, not the socket inode: a nova_libvirt restart that replaces
+  # the socket must not leave this agent attached to a dead one. kolla's
+  # nova_libvirt mounts the host's /run straight through, so this really is the
+  # daemon's socket.
+  - "/run/libvirt:/run/libvirt"
+  # On a host path rather than in the container, so the agent's own crash is
+  # not a way to leave a guest frozen: a restarted agent reads this and thaws
+  # before it serves.
+  - "/var/lib/ferry/compute:/var/lib/ferry/compute"
+  # QEMU's copy-before-write scratch, and it has to be a path QEMU can open —
+  # which is not the same as a path this agent can open.
+  #
+  # libvirt and QEMU run in kolla's nova_libvirt, so the scratch has to be in a
+  # volume THAT container has. `libvirtd` is the one it already mounts at
+  # /var/lib/libvirt, so putting the scratch inside it means both processes name
+  # the same directory and neither needs a new mount. Anything else — a host
+  # path this agent alone can see — fails at blockdev-add with "No such file or
+  # directory", naming a file the agent has just successfully created.
+  - "{{ (ferry_libvirt_volume ~ ':/var/lib/libvirt/') if ferry_local_disk_backup | bool else '' }}"
+  # Nova's instances directory, which is where a local root actually lives.
+  #
+  # Read-write, and only for the restore half: the read path never needed it
+  # because it reads through the export QEMU opens, and the write path opens
+  # the disk itself. Without this the agent reports "no such file or directory"
+  # naming a path libvirt has just told it about.
+  - "{{ (ferry_nova_instances_volume ~ ':/var/lib/nova/') if ferry_local_disk_restore | bool else '' }}"
+  # See ferry_compute_block_restore: the host's device nodes, for a volume that
+  # is masked here and has no mover in the storage fabric to write it instead.
+  - "{{ '/dev:/dev' if ferry_compute_block_restore | bool else '' }}"
+
+####################
+# Naming
+####################
+# A cloud is an OpenStack deployment; a site is the locality domain movers and
+# repositories share. They are 1:1 in most deployments and deliberately
+# still two keys: a second site in the same cloud is how data is kept local.
+#
+# SET THIS PER CLOUD. The default is the Keystone region name, which is
+# `RegionOne` on very nearly every OpenStack ever deployed — so two clouds
+# installed from this role both call themselves `regionone`. The name is not
+# cosmetic: it is written into `origin.cloud_name` on every point object, and a
+# recovery binding is keyed on `(origin_cloud, source_resource_id)`. Two
+# clouds sharing a repository under the same name produce points no reading
+# region can tell apart, and bindings that collide.
+#
+# The default is kept because a single-cloud deployment is the common case and
+# it is right there. Two things now cover the case where it is not: the precheck
+# below warns at deploy time when the name is one every install ships, and the
+# manager stamps a minted per-deployment uid into every point beside the name,
+# so a repository holding two deployments under one name is detected from the
+# objects themselves and a recovery profile is refused rather than guessed.
+ferry_cloud_name: "{{ openstack_region_name | lower }}"
+ferry_site_name: "{{ ferry_cloud_name }}"
+
+# The names that identify nothing, because every OpenStack install ships one of
+# them. The precheck warns when ferry_cloud_name is still one of these; the
+# manager itself detects the collision for real, out of the point objects in a
+# shared repository, and refuses to resolve a recovery profile against a name
+# two deployments used.
+ferry_precheck_cloud_name: true
+ferry_generic_cloud_names:
+  - regionone
+  - region1
+  - regionn
+  - default
+  - openstack
+  - nova
+
+####################
+# Database
+####################
+ferry_database_name: "ferry"
+ferry_database_user: "{% if use_preconfigured_databases | bool and use_common_mariadb_user | bool %}{{ database_user }}{% else %}ferry{% endif %}"
+ferry_database_address: "{{ database_address | put_address_in_context('url') }}:{{ database_port }}"
+
+# go-sql-driver's DSN, not a SQLAlchemy URL. parseTime and loc=UTC are not
+# decoration: DATETIME(6) has to scan into time.Time or the manager refuses to
+# start, and the SELECT ... FOR UPDATE SKIP LOCKED it relies on needs MariaDB 10.6, which
+# db.assert_version checks rather than assumes.
+ferry_database_dsn: >-
+  {{ ferry_database_user }}:{{ ferry_database_password }}@tcp({{ ferry_database_address }})/{{ ferry_database_name }}?parseTime=true&loc=UTC
+
+####################
+# Database sharding
+####################
+ferry_database_shard_root_user: "{% if enable_proxysql | bool %}root_shard_{{ ferry_database_shard_id }}{% else %}{{ database_user }}{% endif %}"
+ferry_database_shard_id: "{{ mariadb_default_database_shard_id | int }}"
+# A schema rule only, which is what every upstream service defines and the only
+# shape kolla-ansible 2025.1 can render: its rules.yaml.j2 reads rule['schema']
+# unconditionally, so a user-keyed rule — legal at 2026.1, which guards the
+# lookup — fails the whole deploy there with "'dict object' has no attribute
+# 'schema'".
+#
+# Nothing is lost by dropping it. shard_id on the user entry below already sets
+# that user's default_hostgroup to the shard's writer group, which is what a
+# user-keyed rule would have done; both releases' users.yaml.j2 honour it.
+ferry_database_shard:
+  users:
+    - user: "{{ ferry_database_user }}"
+      password: "{{ ferry_database_password }}"
+      shard_id: "{{ ferry_database_shard_id }}"
+  rules:
+    - schema: "{{ ferry_database_name }}"
+      shard_id: "{{ ferry_database_shard_id }}"
+
+####################
+# Keystone
+####################
+ferry_keystone_user: "ferry"
+# The project Ferry's service user lives in. Kolla puts every service user in
+# "service"; it is named here rather than derived because the trust a restore
+# runs under authenticates with this user's password, and password auth needs a
+# scope of its own.
+ferry_keystone_project: "service"
+
+# The credential service-ks-register itself authenticates with — kolla's admin,
+# not Ferry's. Ferry's own credential is the one in manager.yaml.
+openstack_ferry_auth: "{{ openstack_auth }}"
+
+ferry_ks_services:
+  - name: "ferry"
+    type: "backup"
+    description: "Ferry: backup, recovery and DRaaS"
+    endpoints:
+      - {'interface': 'internal', 'url': '{{ ferry_internal_endpoint }}'}
+      - {'interface': 'public', 'url': '{{ ferry_public_endpoint }}'}
+
+# admin, not reader: the reconcile enumerates Nova instances across every
+# project and discovery reads resources it does not own. Narrowing this
+# is a policy exercise (policy.file), not a credential one.
+ferry_ks_users:
+  - project: "service"
+    user: "{{ ferry_keystone_user }}"
+    password: "{{ ferry_keystone_password }}"
+    role: "admin"
+
+# reader as a role grant on the existing user rather than a second entry in
+# ferry_ks_users: listing the user twice makes service-ks-register run
+# identity_user twice, which reports changed on every deploy forever.
+ferry_ks_user_roles:
+  - project: "service"
+    user: "{{ ferry_keystone_user }}"
+    role: "reader"
+
+# Ferry authenticates with a Keystone application credential, and this
+# is not a preference: the manager validates tenant tokens with one, and
+# ferry-manager refuses to start with only a service-account password. Nothing
+# in kolla creates application credentials, so appcred.yml does — see there for
+# why the secret is supplied rather than generated.
+#
+# Set these two in globals.yml to use a credential you created yourself; they
+# take precedence and appcred.yml then does nothing.
+ferry_keystone_application_credential_id: ""
+ferry_keystone_application_credential_secret: ""
+
+ferry_keystone_application_credential_name: "ferry"
+# The secret actually deployed: whichever of the two is set. The override wins.
+ferry_keystone_password_appcred: >-
+  {{ ferry_keystone_application_credential_secret
+     if ferry_keystone_application_credential_secret | length > 0
+     else ferry_keystone_appcred_secret }}
+# Where the credential's id is remembered between runs. Keystone cannot re-read
+# a secret and the ansible module recreates on every run, so without this the
+# id would change on every deploy and restart the manager for nothing.
+ferry_appcred_file: "{{ node_custom_config }}/ferry/appcred.yml"
+# Must be roles the ferry service user already holds on the service project:
+# reader for discovery and the resource listings, admin for the
+# Nova orphan reconcile and the operator endpoints.
+#
+# Only reaches Keystone on kolla-ansible 2026.1 and newer — see appcred.yml for
+# why, and for what happens instead below that.
+ferry_appcred_roles:
+  - name: "admin"
+  - name: "reader"
+
+# The manager reasserts its own catalog entry on a loop. Off here,
+# because on a kolla cloud the catalog belongs to service-ks-register and two
+# writers with different opinions about the URL rewrite each other every
+# fifteen minutes.
+# How long the Keystone trust a restore runs under stays valid. It must exceed
+# the longest restore: Cinder is called at both ends of one, to hold the target
+# volume and to release it. Expiry is what guarantees the delegation does not
+# outlive its restore — Keystone's default policy will not always let Ferry
+# delete a trust it did not grant.
+ferry_restore_trust_ttl: "24h"
+
+ferry_register_in_catalog: false
+
+####################
+# Ceph
+####################
+# Ferry reads production RBD images directly; there is no Cinder or Nova API in
+# the data path. It needs ceph.conf and three cephx identities, with
+# a deliberate privilege split:
+#
+#   client.ferry-manager   snapshots production, rotates anchors, polls
+#                          `rbd trash ls`. The manager's, and only the
+#                          manager's.
+#   client.ferry-mover     READ-ONLY on production, read-write on Ferry's own
+#                          pools. Named by every backup, verify, GC and tiering
+#                          work order.
+#   client.ferry-restore   read-write on the volume pools, named by a restore
+#                          work order and nothing else — a restore writes into
+#                          a live volume's image, which is exactly what the
+#                          mover's key must not be able to do.
+#
+# Put ceph.conf and the three keyrings in {{ node_custom_config }}/ferry/ceph/.
+# kolla-ansible/tools/create-cephx.sh mints them with the right caps.
+ferry_ceph_enabled: true
+ferry_ceph_config_dir: "{{ node_custom_config }}/ferry/ceph"
+
+ferry_ceph_manager_user: "ferry-manager"
+ferry_ceph_mover_user: "ferry-mover"
+ferry_ceph_restore_user: "ferry-restore"
+
+# Which pools the reconciler polls. `volumes` and `vms` are kolla's defaults
+# for Cinder and Nova; a cloud that renamed them has to say so here.
+ferry_ceph_volume_pools: "{{ [ceph_cinder_pool_name] if ceph_cinder_pool_name is defined else ['volumes'] }}"
+ferry_ceph_vm_pools: "{{ [ceph_nova_pool_name] if ceph_nova_pool_name is defined else ['vms'] }}"
+ferry_ceph_image_pools: "{{ [ceph_glance_pool_name] if ceph_glance_pool_name is defined else ['images'] }}"
+ferry_ceph_remove_nova_orphans: false
+
+# Ferry's own pools: the chunk repository when it is RADOS-backed, and the RBD
+# tier. Both are optional; they are listed here because a mover will not
+# be dispatched work for a pool it has not advertised.
+ferry_ceph_own_pools:
+  - "ferry-repo"
+  - "ferry-tier"
+
+# Cinder does not publish volume_name_template through any API, so nothing can
+# derive it. "volume-%s" is only the default: a cloud configured with "%s" has
+# every volume refused as "image does not exist", which is the most misleading
+# possible way to be wrong about a name.
+ferry_ceph_volume_name_template: "volume-%s"
+
+ferry_mover_readable_pools: "{{ ferry_ceph_volume_pools + ferry_ceph_vm_pools + ferry_ceph_image_pools + ferry_ceph_own_pools }}"
+ferry_mover_writable_pools: "{{ ferry_ceph_own_pools }}"
+# Empty on purpose, and it must stay empty unless an operator means to override.
+#
+# The mover derives its own capabilities when this list is empty — librbd if it
+# has a Ceph dialer, localdisk if it has a compute certificate, the object
+# drivers it links, and attach once the connector has actually answered at
+# registration. Naming any of them here REPLACES that derivation wholesale, so a
+# hardcoded list is how a mover ends up advertising librbd on a host that cannot
+# reach Ceph, or — worse, because it fails silently — never advertising
+# localdisk on a host that can read guest disks, leaving the manager with nowhere
+# to place local-disk work and no reason to say so.
+ferry_mover_capabilities: []
+
+####################
+# KMS
+####################
+# The key domain is the repository, not the cloud, and keys must follow
+# the data. The KEK that wraps every per-domain DEK belongs in a managed key
+# store — one the cloud already replicates, backs up and audits.
+#
+# ferry-manager also has a `file` driver, a KEK on local disk. This plugin does
+# NOT support it, and precheck.yml refuses it. A file on one node is a key with
+# no custody story: nothing replicates it, nothing backs it up, and it dies
+# with the node — taking every backup point in the repository with it, because
+# the DEKs are only ever stored wrapped. It is a lab affordance, and a kolla
+# cloud has Barbican.
+#
+# Note what Barbican does and does not buy. It does not stop there being one
+# key whose loss loses everything — that is what envelope encryption is. It
+# moves that key into a service with real key custody. The mitigation for
+# losing a cloud is a portable key envelope:
+# POST /v1/repositories/{id}/domain-keys/export writes the DEK wrapped under a
+# passphrase, with the repository and domain bound into the AEAD, for import
+# into another cloud's key manager.
+ferry_kms_driver: "barbican"
+
+# The Barbican secret holding the KEK: a bare UUID or a full secret href.
+# Deliberately not created by this role. Provisioning the key that decrypts
+# every backup a tenant owns should be an operator action that leaves a trail,
+# not a side effect of a deploy — and a KEK reminted because a variable was
+# empty is a repository nobody can read. kolla-ansible/tools/create-kek.sh mints
+# one and prints the id to put here.
+ferry_kms_barbican_secret_id: ""
+
+ferry_kms_vault_address: ""
+ferry_kms_vault_mount: "transit"
+ferry_kms_vault_key_name: "ferry"
+# A Vault token, or — better — a file a Vault Agent keeps a fresh one in.
+#
+# Ferry performs no AppRole login of its own. role_id and secret_id below are
+# accepted so a deployment that has them gets told what to do rather than a
+# rejected key, but they are NOT sufficient on their own: run a Vault Agent
+# with an approle auto-auth and a file sink, mount the sink into the manager,
+# and point ferry_kms_vault_token_file at it. The agent renews; Ferry re-reads.
+ferry_kms_vault_token: ""
+ferry_kms_vault_token_file: ""
+ferry_kms_vault_role_id: ""
+ferry_kms_vault_secret_id: ""
+
+####################
+# PKI
+####################
+# Three mTLS relationships, one CA, and none of them can use kolla's own
+# certificates: kolla's internal PEM is a server certificate for the VIP, and
+# what Ferry needs is a private CA that issues client certificates whose CN
+# means something.
+#
+#   mover  -> manager   the pull protocol (9777). The claim response carries an
+#                       unwrapped DEK, so the manager refuses a request whose
+#                       mover_id is not the client certificate's CN. One CN per
+#                       mover, never one for the fleet.
+#   manager-> compute   the quiesce API (9779). A component that can freeze a
+#                       production database is not one to leave on a bearer
+#                       token.
+#
+# Generated on the deploy host, once, and reused: an existing CA is never
+# reminted, so re-running does not invalidate deployed certificates.
+ferry_pki_generate: true
+ferry_pki_dir: "{{ node_custom_config }}/ferry/pki"
+ferry_pki_valid_days: 3650
+ferry_pki_key_size: 2048
+# How long before expiry a per-host key and certificate are reissued. A deploy
+# skips the hosts whose material is still current, which is what keeps a
+# 41-hypervisor cloud from re-running 123 serial RSA operations every rollout.
+ferry_pki_renew_before_days: 30
+
+ferry_manager_client_cn: "ferry-manager-{{ ferry_cloud_name }}"
+
+# mover_id is not cosmetic. The manager refuses any register/claim/heartbeat/
+# complete whose mover_id is not the common name of the client certificate that
+# carried it, so a mover holding a valid certificate cannot claim another
+# mover's jobs and be handed its keys. It is also a soft affinity hint.
+ferry_mover_id: "ferry-mover-{{ inventory_hostname }}"
+
+####################
+# Load and limits
+####################
+# The fastest route to being uninstalled is making the production cluster
+# slow, so every one of these is a ceiling rather than a target. They are the
+# manager's view; a mover has its own and a work order may ask for less than
+# either but never for more.
+ferry_max_concurrent_reads_per_pool: 4
+ferry_osd_client_op_priority: 1
+ferry_read_parallelism: 4
+ferry_upload_parallelism: 4
+ferry_max_inflight_jobs: 16
+# A recovering cluster does not also get a backup run. Leave this on. It is a
+# var only because a permanently HEALTH_WARN single-host lab — RGW pools sized
+# 3 on two OSDs, say — would otherwise never dispatch anything at all.
+ferry_pause_when_degraded: true
+
+# The site's egress budget, in bytes/sec. Unlike the ceilings above this
+# one is site-wide, not per mover: the manager divides it among the movers that
+# have work. 0 leaves uploads unmetered, which is the behaviour of every
+# deployment before this existed.
+#
+# The burst raises the whole site to ferry_upload_burst_bps for
+# ferry_upload_burst_for, no more often than ferry_upload_burst_every, and is
+# taken only when a mover reports it is actually stalled on its share. Leave
+# ferry_upload_burst_bps at 0 to never burst.
+#
+# Neither may be set below 4 MiB/s — one chunk — and the manager refuses to
+# start if either is. A ceiling smaller than the unit Ferry moves data in stalls
+# every chunk past its lease instead of shaping anything.
+ferry_upload_sustained_bps: 0
+ferry_upload_burst_bps: 0
+ferry_upload_burst_for: 5m
+ferry_upload_burst_every: 1h
+# Rules put the two ceilings on a schedule, read on the manager host's clock.
+# Inside a rule its own numbers apply; outside every rule the pair above does.
+# A rule states both of its ceilings: sustained_bps 0 leaves uploads unmetered
+# for its hours, and a missing or 0 burst_bps means no burst during them. days
+# is mon..sun and empty means every day; to may be 24:00, and a to at or before
+# from wraps midnight and belongs to the day it starts on. Rules may not
+# overlap. Quote the hours: an unquoted 07:00 is the number 420 to Ansible's
+# YAML. The usual shape is one row that holds the office's link by day:
+#
+# ferry_upload_sustained_bps: 50000000       # 400 Mbit/s, the night's allowance
+# ferry_upload_rules:
+#   - days: [mon, tue, wed, thu, fri]
+#     from: "07:00"
+#     to: "21:00"
+#     sustained_bps: 12500000                # 100 Mbit/s while the office is on the link
+ferry_upload_rules: []
+
+# How long a mover waits for its repository to open before handing the
+# job back. It is the one call in a job with no deadline of its own: unbounded,
+# a name that will not resolve or a port that blackholes leaves the job in no
+# phase for minutes, renewing its lease, before it fails. Two consecutive
+# failures also stop that mover being sent that repository's work until it can
+# open it again.
+ferry_mover_repo_open_timeout: 30s
+
+ferry_mover_drain_timeout_seconds: 90
+ferry_mover_stop_timeout: "{{ ferry_mover_drain_timeout_seconds | int + 60 }}"
+
+ferry_mover_max_parallel: 2
+ferry_mover_image_parallelism: 2
+ferry_mover_segment_parallelism: 2
+ferry_mover_read_parallelism: 2
+ferry_mover_upload_parallelism: 2
+
+####################
+# GC
+####################
+# The grace period is the only thing standing between a concurrent backup and
+# data loss: a chunk is deleted when it is unreferenced AND older than this,
+# which is why two concurrent sweeps reach the same conclusion.
+ferry_gc_grace_period: "48h"
+# Longer than the manager's, so a mover-side sweep can never be the more
+# aggressive of the two.
+ferry_mover_gc_grace_period: "72h"
+
+ferry_dr_enabled: false
+ferry_ceph_mirror_drive_schedule: false
+ferry_ceph_mirror_enable_images: false
+ferry_dr_run_deadline: "12h"
+ferry_dr_probe_image: ""
+ferry_dr_probe_flavor: ""
+ferry_dr_probe_direct: false
+
+####################
+# Where a mover finds a manager
+####################
+# Movers pull work, so nothing dials a mover and a mover has exactly one
+# outbound dependency. With haproxy in front, that is the internal VIP in TCP
+# mode and any manager may answer, which is what "N identical replicas
+# with no roles" is supposed to look like from the outside. Without haproxy
+# there is nothing to spread over, so it is the first manager host.
+ferry_mover_manager_url: >-
+  {{ 'https://' ~ (kolla_internal_vip_address | put_address_in_context('url')) ~ ':' ~ ferry_mover_api_port
+     if enable_haproxy | bool
+     else 'https://' ~ (('api' | kolla_address(groups['ferry-manager'][0])) | put_address_in_context('url')) ~ ':' ~ ferry_mover_api_listen_port }}
+
+####################
+# Quiesce
+####################
+# Off by default: a guest without tools gets a crash-consistent
+# backup, reported, not a failed one.
+ferry_require_quiesce: false
+ferry_max_freeze: "30s"
+
+# Nova's `host` attribute is whatever the compute service registered itself as.
+# It is not a promise of a resolvable name, and the manager dials ferry-compute
+# by exactly that name — so on a cloud whose hypervisor names do not resolve,
+# every filesystem-consistent plan degrades to crash-consistent, forever, with
+# a log line as the only evidence.
+#
+# manager.yaml.j2 derives the map from the inventory: kolla's nova-compute
+# takes its host from the node's hostname, which is what ansible_facts.hostname
+# reports. This var is for the exceptions — a compute service registered under
+# a name that is not its hostname — and is merged over the derived map.
+ferry_quiesce_extra_hosts: {}
+
+####################
+# Logging
+####################
+ferry_log_level: "{{ 'debug' if openstack_logging_debug | bool else 'info' }}"
+
+# Every record also goes to a file on the kolla_logs volume, which is where
+# fluentd reads every service's logs from — /var/log/kolla/ferry/<component>.log.
+# stderr keeps receiving them too, so `docker logs` still works. Ferry rotates
+# the file itself: kolla's logrotate names the services it rotates and an
+# out-of-tree one is not on that list. Ceilings match kolla's own defaults.
+# See kolla-ansible/etc/fluentd/ for the input that ships the file to OpenSearch.
+ferry_log_file_enabled: true
+ferry_log_file_max_mib: 50
+ferry_log_file_keep: 6
+
+####################
+# Copy certificates
+####################
+ferry_copy_certs: "{{ kolla_copy_ca_into_containers | bool }}"
+
+####################
+# Toggles and endpoints
+####################
+# These lived in a group_vars/all fragment symlinked into kolla's own
+# group_vars until kolla-ansible 2025.1 made that impossible: `group_vars/all`
+# is a DIRECTORY only from 2025.2 onward, and on 2025.1 and earlier it is the
+# single file all.yml. Creating a directory beside it does not merge — ansible's
+# DataLoader.find_vars_files breaks on the first hit and checks the directory
+# form first, so the directory would be loaded INSTEAD of kolla's all.yml and
+# every kolla variable would silently vanish.
+#
+# Role defaults are in scope wherever this role runs, including tasks/loadbalancer.yml
+# which hands ferry_services to kolla's loadbalancer-config. The one place they
+# are NOT in scope is ferry.yml's `hosts: all` grouping play, which runs no
+# role — so enable_ferry carries an inline `| default(false)` there.
+
+# Off unless asked for. Nothing in this plugin runs against a cloud whose
+# operator has not said `enable_ferry: "yes"`.
+enable_ferry: false
+
+# The mover is the data plane and the compute agent is the quiesce agent. Both
+# are optional on their own: without a mover Ferry dispatches nothing, and
+# without the agent backups are crash-consistent, which is a supported mode
+# rather than a failure.
+enable_ferry_mover: "{{ enable_ferry | bool }}"
+enable_ferry_compute: "{{ enable_ferry | bool }}"
+
+####################
+# Endpoints
+####################
+ferry_internal_fqdn: "{{ kolla_internal_fqdn }}"
+ferry_external_fqdn: "{{ kolla_external_fqdn }}"
+
+# Ferry's API is versioned in the path and the catalog entry points at /v1, the
+# same shape Cinder's does. A tenant resolves service type "backup" from
+# their own cloud's catalog and gets here.
+ferry_internal_endpoint: "{{ ferry_internal_fqdn | kolla_url(internal_protocol, ferry_api_port, '/v1') }}"
+ferry_public_endpoint: "{{ ferry_external_fqdn | kolla_url(public_protocol, ferry_api_public_port, '/v1') }}"
+
+####################
+# Ports
+####################
+# 9776 — the Keystone-authenticated tenant and operator API, plus the SPA. The
+# only surface that belongs on the VIP.
+ferry_api_port: "9776"
+ferry_api_public_port: "{{ haproxy_single_external_frontend_public_port if haproxy_single_external_frontend | bool else ferry_api_port }}"
+ferry_api_listen_port: "{{ ferry_api_port }}"
+
+# 9777 — the mover pull protocol. mTLS by construction and never token
+# authenticated, because a claim response carries an unwrapped per-domain DEK
+# and the repository's credentials inline. It is fronted in TCP mode so
+# haproxy passes the client certificate through untouched; it is never external.
+ferry_mover_api_port: "9777"
+ferry_mover_api_listen_port: "{{ ferry_mover_api_port }}"
+
+# 9779 — ferry-compute's quiesce API, mTLS, dialled by the managers only.
+ferry_compute_api_port: "9779"
+
+# Admin listeners: /metrics, /healthz, /readyz. Loopback unless
+# ferry_admin_bind_internal binds them on api_interface; never fronted.
+ferry_admin_port: "9775"
+ferry_mover_admin_port: "9782"
+ferry_compute_admin_port: "9780"
+ferry_admin_bind_internal: false
+ferry_admin_bind_address: "{{ api_interface_address if ferry_admin_bind_internal | bool else '127.0.0.1' }}"
+ferry_prometheus_integration: false
+
+####################
+# kolla-ansible compatibility
+####################
+# Ferry supports kolla-ansible 2025.1 Epoxy and newer. Two upstream facts are
+# probed rather than compared against openstack_release, which is an image-tag
+# intent an operator may legitimately override and which is the string "master"
+# on a git checkout.
+#
+# Epoxy is the floor because of kolla_container_facts: 2024.1 has no `action`
+# parameter at all and fails loudly, while 2024.2 accepts it and then returns a
+# FLAT result — so `container_facts.containers[...]` is undefined, the port
+# prechecks all run, and a re-run against a live Ferry reports a spurious "port
+# in use". A silent wrong answer is worse than a crash, which is why 2024.2 is
+# refused rather than shimmed.
+#
+# The Epoxy floor itself is enforced in ferry.yml's grouping play, not here:
+# that play runs no role, so a role default would not be in scope for it.
+
+# 2026.1 Gazpacho is the first release whose kolla_toolbox passes module_args
+# through as structured data instead of stringifying them, and openstack_auth_cloud
+# arrived in the same release — so its presence is an exact, cheap probe for
+# "can a list survive the toolbox". appcred.yml is the only caller.
+ferry_kolla_carries_list_args: "{{ openstack_auth_cloud is defined }}"
+
+###############################################################################
+# The storage fabric
+#
+# A mover in the fabric can attach a Cinder volume to itself, which is the only
+# way to back up a volume nothing has open and the only way to restore onto a
+# volume that is not ceph-backed. On a cloud whose storage is a SAN that is
+# every restore, so this is not optional there — and on a Ceph-only cloud
+# nothing here applies.
+#
+# The image is the same either way. What differs is how the container is run —
+# privileged, host network, the host's /dev — and that is why the hosts are a
+# group rather than a flag: fabric access is zoning and initiator registration
+# on a real array, which is per host and not something a deploy can conjure.
+###############################################################################
+
+# Hosts in the ferry-mover-fabric group get the fabric treatment. Empty by
+# default: a deployment that adds nothing here runs exactly as it did before.
+ferry_fabric_enabled: "{{ groups['ferry-mover-fabric'] | default([]) | length > 0 }}"
+
+###############################################################################
+# The local-disk data path
+###############################################################################
+# Whether ferry-compute reads guest disks as well as freezing them.
+#
+# Off by default, and deliberately a choice rather than something inherited on
+# upgrade: turning it on makes the quiesce agent a data-plane component that can
+# stream the contents of any guest disk on its node to a mover. An operator
+# should decide that.
+#
+# On unless the whole cloud is Ceph, once a deployment does turn it on — an
+# all-Ceph cloud reads every disk from the cluster and needs none of this.
+ferry_local_disk_backup: false
+
+# Whether this node's agent may also WRITE the disks it can read.
+#
+# On by default wherever the backup half is, because a backup nothing can put
+# back is not a backup: a Nova ephemeral root has no Cinder volume to restore
+# into and no RBD image to open, so the agent that read it is the only thing
+# that can write it. The agent still refuses unless the guest is shut off, and
+# refuses any disk whose format is not raw.
+ferry_local_disk_restore: "{{ ferry_local_disk_backup }}"
+
+# Whether that write path may also reach a disk that is a block device on this
+# host — a Cinder volume masked here over iSCSI, FC or NVMe-oF, or an LVM
+# target.
+#
+# OFF, and separately from the line above, because it is the one setting that
+# widens what the agent can touch. Reaching a device node means mounting the
+# host's /dev — every block device on the node, rather than the instances
+# directory this agent already has — AND running the container privileged: the
+# device cgroup denies the open outright, and no capability lifts that.
+#
+# Ferry can usually avoid needing it: such a volume is reachable by a mover in
+# the storage fabric, which writes it without involving the hypervisor at all.
+# Turn this on only where there is no fabric mover and the alternative
+# is a volume that can be backed up and not restored.
+ferry_compute_block_restore: false
+
+# QEMU's copy-before-write scratch, and the one setting here worth reading twice
+# before changing.
+#
+# It grows with guest WRITES for as long as a backup session lives, so it must
+# not share a filesystem with the instances: filling it there stops the guests,
+# which is a far worse outcome than a failed backup. The default keeps it inside
+# kolla's `libvirtd` volume, which is where QEMU can actually open it.
+ferry_compute_scratch_dir: "/var/lib/libvirt/ferry/scratch"
+ferry_compute_socket_dir: "/var/lib/libvirt/ferry/sockets"
+ferry_compute_state_file: "/var/lib/ferry/compute/backups.json"
+
+# Who has to be able to write the scratch and socket directories: QEMU, not
+# Ferry. kolla runs QEMU as `nova`, which reaches them through the `qemu` group,
+# so the directories are owned by that group and ferry-compute — running as root
+# — never gets to decide their mode.
+#
+# NUMERIC, and that is not a style choice. `qemu` is a user inside nova_libvirt,
+# and these directories are created on the host, where no such user exists — a
+# name here fails with "failed to look up user qemu" on every compute node. The
+# ids are kolla's fixed ones; the deploy re-reads them from the container when
+# it is running, so an image that renumbered them still works.
+ferry_qemu_uid: 42427
+ferry_qemu_gid: 42427
+
+# Where libvirt keeps its state on this host, mirroring nova-cell's own
+# nova_libvirt_volume: a named volume when libvirt runs in a container, the host
+# path when it does not.
+#
+# Restated here rather than referenced because it is a nova-cell ROLE default,
+# not a global — this role cannot see it, and a reference resolves to undefined
+# at the worst possible moment, inside a conditional.
+# Where nova keeps its instances on this host, mirroring ferry_libvirt_volume
+# and restated for the same reason: it is a nova-cell ROLE default, invisible
+# from here.
+ferry_nova_instances_volume: "{{ 'nova_compute' if enable_nova_libvirt_container | default(true) | bool else '/var/lib/nova' }}"
+
+ferry_libvirt_volume: "{{ 'libvirtd' if enable_nova_libvirt_container | default(true) | bool else '/var/lib/libvirt' }}"
+
+# How long one backup session may live regardless of who is still listening.
+#
+# Sized for the slowest legitimate run rather than the usual one: a raw SAN LUN
+# carries no dirty bitmap, so every run of it is a full read, and the honest
+# ceiling is how long reading the largest volume on this node takes.
+ferry_compute_backup_max_duration: "24h"
+ferry_compute_backup_default_ttl: "1h"
+
+# Each session costs a QEMU block job and a growing scratch file, so backing up
+# every guest on a node at once is a self-inflicted outage in the same way
+# freezing them all is.
+ferry_compute_backup_max_concurrent: 2
+
+# End a session whose scratch grows past this. A write-heavy guest can fill the
+# scratch filesystem faster than the backup drains it, and the backup is the
+# thing that should die. 0 disables.
+ferry_compute_max_scratch_bytes: 0
+
+# The mover's side of the same path: how it dials the agents. Its own client
+# certificate is the whole of the authentication — the routes it calls return
+# the contents of a guest's disk — so there is no unauthenticated form of this.
+ferry_mover_compute_timeout: "5m"
+
+# The manager's side: how long a compute node's capability answer is reused, and
+# the idle deadline it hands each agent.
+ferry_local_disk_cache_ttl: "1m"
+ferry_local_disk_session_ttl: "30m"
+
+# Whether to warn when the scratch shares a filesystem with the instances. A
+# judgement rather than a fact — a node with one big NVMe and a scratch ceiling
+# set is a deliberate choice, not a mistake.
+ferry_precheck_scratch_filesystem: true
+
+###############################################################################
+# Object storage
+###############################################################################
+# Whether this cloud protects buckets. The one flag: on a deployment
+# whose RGW kolla already knows about, turning it on is the whole change — the
+# endpoint below is derived from kolla's own ceph_rgw variables and the gateway
+# credential is read from the file create-rgw-user.sh wrote.
+#
+# Off means this cloud does not protect buckets at all: a bucket plan is refused
+# at creation with that as the reason, which is the honest answer for a
+# deployment that has no gateway, and the console hides the feature rather than
+# offering something that cannot work.
+ferry_objects_enabled: false
+
+# RGW's S3 endpoint. Derived from kolla's own RGW variables, which is where a
+# kolla deployment already records where its gateway is; set it explicitly for
+# an RGW kolla does not know about.
+#
+# Deliberately NOT the catalog's object-store entry and not ceph_rgw_port's
+# endpoint path: a deployment registers the SWIFT-compatible endpoint as
+# object-store (…/swift/v1), so resolving through the catalog finds the Swift
+# URL and answers every S3 request with a 404. S3 lives at the root of the same
+# listener.
+ferry_objects_endpoint: >-
+  {{ ('http://' ~ kolla_internal_vip_address ~ ':' ~ ceph_rgw_port)
+     if (ferry_objects_enabled | bool and enable_ceph_rgw is defined and enable_ceph_rgw | bool)
+     else '' }}
+ferry_objects_name: "rgw"
+ferry_objects_region: "us-east-1"
+ferry_objects_admin_path: "admin"
+ferry_objects_max_concurrent_gets: 8
+
+# The gateway credential: an RGW user with `system` set, which reads any bucket
+# in the realm. Left empty here and loaded from ferry_objects_file, because
+# minting it needs radosgw-admin on a host with a Ceph admin keyring — which a
+# kolla control host is not, on any cloud whose Ceph is deployed separately.
+#
+# Run kolla-ansible/tools/create-rgw-user.sh once on such a host; it is
+# idempotent and writes the file below. Setting these two explicitly overrides
+# it, for an operator who would rather keep the secret somewhere else.
+ferry_objects_access_key: ""
+ferry_objects_secret_key: ""
+
+# Where create-rgw-user.sh records the gateway credential, read on the deploy
+# host exactly as the Keystone application credential is.
+ferry_objects_file: "{{ node_custom_config }}/ferry/objects.yml"
+
+# The RGW pools a bucket backup loads, so the per-pool ceilings bind on bucket
+# work. Usually the realm's data pool; leave empty to charge nothing, which
+# means bucket reads are uncapped.
+ferry_objects_data_pools: []
+
+# Which transports these movers use. iSCSI needs a kernel module and an
+# initiator name; Fibre Channel needs neither, because the HBA and the kernel
+# do it.
+ferry_fabric_iscsi: true
+# NVMe-oF over TCP. Off by default because most fabrics are not NVMe yet, and a
+# module loaded for nothing is still a module loaded.
+ferry_fabric_nvmeof: false
+# DEVICE-MAPPER multipath only. NVMe-oF does its own, in the kernel (ANA), and
+# the connector detects that separately — this switch neither enables nor
+# disables it.
+ferry_fabric_multipath: "{{ enable_multipathd | default(false) | bool }}"
+
+# Where os-brick serialises iSCSI logins and multipath assembly. It has no
+# default of its own and raises on the first connect without one.
+ferry_fabric_lock_dir: "/var/lib/ferry/locks"
+
+# The program that turns Cinder's connection_info into a device on this host.
+# The shipped one wraps os-brick; anything speaking its three verbs will do,
+# which is the escape hatch for a fabric os-brick has never heard of.
+ferry_fabric_connector: "/usr/local/bin/ferry-connector"
+ferry_fabric_connector_timeout: "3m"
+
+# What the connector reads from its environment. The role computes all three and
+# used to tell it none of them, so the shipped defaults applied whatever the
+# deployment had decided.
+#
+# The multipath one is the reason this exists. Its default is ON, so a cloud
+# that runs no multipathd still had os-brick take the multipath path on every
+# attach, hunt for a device-mapper node that was never going to appear, and fall
+# back — noisily, with a traceback in the log of a backup that then succeeded.
+ferry_mover_fabric_env:
+  FERRY_CONNECTOR_MULTIPATH: "{{ '1' if ferry_fabric_multipath | bool else '0' }}"
+  FERRY_CONNECTOR_LOCK_PATH: "{{ ferry_fabric_lock_dir }}"
+  # The address this host is reachable at FROM THE ARRAY, which is what Cinder
+  # is told and what some drivers use to pick a portal or write an ACL. The
+  # connector's own default is 127.0.0.1 — harmless on a lab and wrong anywhere
+  # a target has to answer back.
+  FERRY_CONNECTOR_IP: "{{ ferry_fabric_ip }}"
+
+# Defaults to the storage interface where kolla has one, and the API interface
+# otherwise. A deployment whose fabric is on neither should say so.
+ferry_fabric_ip: "{{ storage_interface_address | default(api_interface_address, true) }}"
+
+# The fabric prechecks that are judgements rather than facts: "you have a SAN
+# and no fabric mover" is right almost always and wrong for a deployment that
+# has decided to restore by hand. Set false to skip those two; the ones that
+# test whether a module exists always run.
+ferry_precheck_fabric: true
+
+# Cinder backends on this cloud that are not ceph, used by the precheck above.
+# Derived where kolla knows, and overridable where it does not — a deployment
+# whose backends come from node_custom_config can name them here.
+ferry_non_ceph_backends: >-
+  {{ (['lvm'] if enable_cinder_backend_lvm | default(false) | bool else [])
+   + (['nfs'] if enable_cinder_backend_nfs | default(false) | bool else [])
+   + (['pure-nvme-tcp'] if enable_cinder_backend_pure_nvme_tcp | default(false) | bool else []) }}
+
+ferry_point_copy_enabled: true
+ferry_point_copy_interval: "1m"
+ferry_point_copy_batch: 32
+
+ferry_policy_resolve_interval: "10m"
+
+ferry_soft_delete_interval: "1h"
+ferry_soft_delete_batch: 50
+
+ferry_missed_tick_interval: "1m"
+ferry_missed_tick_batch: 200
+
+ferry_coverage_minimum_keep_all: "0"
+ferry_coverage_requires_lock: false
+ferry_missed_tick_window: "168h"
+
+ferry_coverage_metrics_enabled: true
+ferry_coverage_interval: "5m"
+
+ferry_policy_verify_enabled: true
+ferry_policy_verify_interval: "10m"
+ferry_policy_verify_batch: 25
+
+# The zone a policy's `at`, its window and its ladder anchors are read in. Empty
+# leaves the manager on the host's own zone, which in a container is UTC.
+ferry_retention_timezone: ""
+
+ferry_console_dir: "{{ node_custom_config }}/ferry/console"
+ferry_console_product_name: ""
+ferry_console_logo: ""
+ferry_console_logo_dark: ""
+ferry_console_logo_only: false
+ferry_console_logo_align: ""
+ferry_console_logo_height: 0
+ferry_console_logo_width: 0
+ferry_console_favicon: ""
+ferry_console_primary_color: ""
+ferry_console_primary_color_dark: ""
+ferry_console_stylesheet: ""
+ferry_console_files: "{{ [ferry_console_logo, ferry_console_logo_dark, ferry_console_favicon, ferry_console_stylesheet] | select | list }}"

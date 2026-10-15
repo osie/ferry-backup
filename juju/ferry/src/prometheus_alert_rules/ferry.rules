@@ -1,0 +1,127 @@
+groups:
+  - name: ferry
+    rules:
+      - alert: FerryTargetDown
+        expr: up{job=~"ferry_.*"} == 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.job }} on {{ $labels.instance }} is not answering on its admin port"
+
+      - alert: FerryNoMoverAlive
+        expr: max(ferry_manager_movers_alive) == 0
+        for: 10m
+        labels:
+          severity: critical
+        annotations:
+          summary: "No backup mover has checked in for 10 minutes; nothing is being backed up"
+
+      - alert: FerryDispatchPaused
+        expr: max without (instance, node, mode) (ferry_manager_dispatch_pause_cause) == 1
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Backup dispatch has been paused for 30 minutes by {{ $labels.source }}: {{ $labels.cause }}"
+
+      - alert: FerryRepositoryDown
+        expr: max without (instance, node, mode) (ferry_manager_repository_available) == 0
+        for: 10m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Repository {{ $labels.repo_id }} has failed its health probe for 10 minutes"
+
+      - alert: FerryJobDeadLettered
+        expr: max without (instance, node, mode) (ferry_manager_jobs_dead_lettered{error_code!~"target_running|target_attached|restore_target_exists"}) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $value }} {{ $labels.kind }} job(s) gave up in the last day with {{ $labels.error_code }}"
+
+      - alert: FerryBucketRemovalGivenUp
+        expr: max without (instance, node, mode) (ferry_manager_bucket_removals_given_up) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $value }} failed bucket restore(s) still hold a bucket whose removal job gave up; remove it by hand or re-run the job"
+
+      - alert: FerryPlanOverdue
+        expr: max without (instance, node, mode) (ferry_manager_plan_resources_overdue) > 0
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Plan {{ $labels.plan }} ({{ $labels.project_id }}) has {{ $value }} resource(s) past their cadence"
+
+      - alert: FerryPlanUnsatisfied
+        expr: max without (instance, node, mode) (ferry_coverage_plans_unsatisfied) > 0
+        for: 1h
+        labels:
+          severity: warning
+        annotations:
+          summary: "Project {{ $labels.project_id }} has {{ $value }} plan(s) whose policy cannot be met"
+
+      - alert: FerryGCDegraded
+        expr: max without (instance, node, mode) (ferry_manager_repository_gc_degraded) == 1
+        for: 6h
+        labels:
+          severity: warning
+        annotations:
+          summary: "Repository {{ $labels.repository }} is not reclaiming anything: its sweep cannot enumerate every live point"
+
+      - alert: FerryGCStale
+        expr: time() - max without (instance, node, mode) (ferry_manager_repository_gc_last_completed_timestamp_seconds) > 3 * 86400
+        for: 1h
+        labels:
+          severity: warning
+        annotations:
+          summary: "Repository {{ $labels.repository }} has not completed a sweep in three days"
+
+      - alert: FerryGuestStuckFrozen
+        expr: ferry_compute_stuck_frozen_guests > 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "{{ $value }} guest(s) on {{ $labels.instance }} are frozen past their deadline"
+
+      - alert: FerryThawFailed
+        expr: increase(ferry_compute_thaw_failures_total[15m]) > 0 or increase(ferry_manager_thaw_failures_total[15m]) > 0
+        labels:
+          severity: critical
+        annotations:
+          summary: "A guest thaw failed on {{ $labels.instance }}"
+
+      - alert: FerryMissedTicks
+        expr: sum without (instance, node, mode) (increase(ferry_manager_missed_ticks_total[1h])) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "Scheduled backups were missed in the last hour"
+
+      - alert: FerryLoopErrors
+        expr: sum without (instance, node, mode) (increase(ferry_manager_loop_errors_total[15m])) > 5
+        labels:
+          severity: warning
+        annotations:
+          summary: "Manager loop {{ $labels.loop }} failed {{ $value }} times in 15 minutes"
+
+      - alert: FerryMoverCannotReachRepository
+        expr: sum without (instance) (increase(ferry_mover_repository_unreachable_total[1h])) > 2
+        labels:
+          severity: warning
+        annotations:
+          summary: "Movers handed back {{ $value }} jobs in an hour: repository {{ $labels.repository }} unreachable ({{ $labels.cause }})"
+
+      - alert: FerryReferencedObjectMissing
+        expr: >-
+          sum without (instance) (increase(ferry_mover_lock_retentions_total{outcome="missing"}[1h])) > 0
+          or
+          sum without (instance) (ferry_mover_lock_retentions_total{outcome="missing"}
+            unless ferry_mover_lock_retentions_total{outcome="missing"} offset 1h) > 0
+        labels:
+          severity: critical
+        annotations:
+          summary: "Repository {{ $labels.repository }} is missing an object a point references: deleted outside Ferry or too early"
