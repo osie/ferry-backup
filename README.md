@@ -1,10 +1,5 @@
 <p align="center">
-  <a href="https://osie.io">
-    <picture>
-      <source media="(prefers-color-scheme: dark)" srcset=".github/assets/osie-logo-dark.svg">
-      <img alt="OSIE" src=".github/assets/osie-logo-light.svg" width="180">
-    </picture>
-  </a>
+  <a href="https://osie.io"><img alt="OSIE" src=".github/assets/osie-logo.svg" width="180"></a>
 </p>
 
 <h1 align="center">Ferry</h1>
@@ -125,6 +120,24 @@ pick one per plan, within [vaults](https://osie.io/docs/ferry/features/vaults/),
 
 </td>
 </tr>
+<tr>
+<td valign="top">
+
+**[Replication](https://osie.io/docs/ferry/features/replication/)**<br>
+A second copy of every backup in another repository, site or provider, with its own
+retention. Replicas made by your object storage register as repositories of their
+own, and the recovery region reads from either.
+
+</td>
+<td valign="top">
+
+**[Monitoring and coverage](https://osie.io/docs/ferry/features/monitoring/)**<br>
+A coverage report of unprotected resources, missed backups and copies still due,
+Prometheus metrics with ready-made alert rules, and a support bundle for diagnosing
+problems.
+
+</td>
+</tr>
 </table>
 
 ## Supported deployments
@@ -142,32 +155,9 @@ distribution provides the database, Keystone, Ceph and the hypervisor agent.
 
 ## Architecture
 
-```mermaid
-flowchart LR
-    subgraph control["Control plane"]
-        manager["ferry-manager<br/>API, scheduler, console"]
-        db[("MariaDB or MySQL")]
-        keystone["Keystone"]
-    end
-    subgraph data["Data plane"]
-        mover["ferry-mover<br/>reads storage, writes the repository"]
-    end
-    subgraph hv["Every hypervisor"]
-        compute["ferry-compute<br/>guest freeze, local disks"]
-        libvirt["libvirt and QEMU"]
-    end
-    ceph[("Ceph")]
-    repo[("S3 repository<br/>Object Lock optional")]
-
-    manager --- db
-    manager --- keystone
-    mover -- "mTLS: work orders" --> manager
-    manager -- "mTLS" --> compute
-    mover -- "mTLS: local disks" --> compute
-    compute --- libvirt
-    mover --> ceph
-    mover --> repo
-```
+<p align="center">
+  <img alt="Ferry's architecture: ferry-manager with Keystone and the database in the control plane, ferry-mover in the data plane reading Ceph and writing the S3 repository, and ferry-compute on every hypervisor, connected by mutual TLS" src=".github/assets/architecture.svg" width="900">
+</p>
 
 Each component holds only what its job needs. The **manager** holds the database and
 the Keystone credential. The **mover** reads production storage and writes the
@@ -238,6 +228,45 @@ Full guide: [juju/README.md](juju/README.md), or
 [on osie.io](https://osie.io/docs/ferry/operate/install/juju/).
 
 </details>
+
+## Using Ferry
+
+Projects work with Ferry from its console, its API or the `openstack backup` commands, which
+authenticate like every other OpenStack command:
+
+```sh
+pip install python-openstackclient python-ferryclient
+```
+
+A project member protects a server and restores it:
+
+```sh
+# The service levels the operator offers to this project
+openstack backup policy list
+
+# Protect a server under one of them, freezing the guest before each backup
+openstack backup plan create web-tier --resource-kind instance \
+  --resource <server-id> --policy <policy> --consistency filesystem
+
+# Take a backup now, then list the plan's backups
+openstack backup point create --plan web-tier --wait
+openstack backup point list --plan web-tier
+
+# Restore a backup as a new server, or attach it read-only to recover files
+openstack backup restore create --point <point-id> --mode instance --name web-01-restored --wait
+openstack backup attachment create --point <point-id> --instance <server-id>
+```
+
+An operator uses the same client for cloud-wide settings, such as a second copy of every backup
+taken under a policy, and to see what is not yet protected:
+
+```sh
+openstack backup policy set <policy> \
+  --copy-repository <repository> --copy-keep daily=7 --copy-keep monthly=12
+openstack backup coverage show
+```
+
+The [CLI reference](https://osie.io/docs/ferry/cli-reference/) lists every command and option.
 
 ## Requirements
 
